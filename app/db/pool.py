@@ -126,22 +126,6 @@ async def init_pool() -> asyncpg.Pool:
             logger.warning("数据库连接第 %d 次失败，%ds 后重试: %s", attempt, wait, e)
             await asyncio.sleep(wait)
 
-    async with _pool.acquire(timeout=60) as conn:  # type: ignore[union-attr]
-        try:
-            await conn.execute(
-                "ALTER TABLE sys_sync_log ADD COLUMN IF NOT EXISTS progress jsonb"
-            )
-            fixed = await conn.execute(
-                "UPDATE sys_sync_log SET status = 'failed', error_message = '服务重启，任务中断' "
-                "WHERE status = 'running' AND started_at < now() - interval '30 minutes'"
-            )
-            if fixed and fixed != "UPDATE 0":
-                logger.info("清理卡住的同步记录: %s", fixed)
-        except asyncpg.exceptions.UndefinedTableError:
-            logger.warning(
-                "表 sys_sync_log 不存在，跳过同步日志迁移（新库或未跑迁移时可忽略）"
-            )
-
     return _pool  # type: ignore[return-value]
 
 
