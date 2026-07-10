@@ -3,7 +3,8 @@ from __future__ import annotations
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 
@@ -54,6 +55,23 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def block_mutations_when_disabled(request: Request, call_next):
+    if (
+        not settings.sf_module_enabled
+        and request.method not in {"GET", "HEAD", "OPTIONS"}
+        and request.url.path.startswith("/api/sf")
+    ):
+        return JSONResponse(
+            status_code=423,
+            content={
+                "detail": "顺丰测试服务当前为只读模式，已拒绝写入/推送类请求。",
+                "sf_module_enabled": False,
+            },
+        )
+    return await call_next(request)
 
 
 @app.get("/health")
