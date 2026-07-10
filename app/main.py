@@ -15,6 +15,7 @@ from app.clients.kingdee import kingdee_client, kingdee_test_client
 from app.config import settings
 from app.db.pool import close_pool, init_pool
 from app.logging_config import setup_logging
+from app.scheduler import get_scheduler_state, start_scheduler, stop_scheduler
 
 setup_logging(log_level=settings.log_level, log_format=settings.log_format)
 logger = logging.getLogger("union.sf_service")
@@ -25,6 +26,7 @@ async def lifespan(app: FastAPI):
     try:
         await init_pool()
         logger.info("SF service asyncpg pool initialized")
+        start_scheduler()
     except Exception as exc:
         logger.error("SF service asyncpg pool init failed: %s", exc, exc_info=True)
         raise
@@ -32,6 +34,7 @@ async def lifespan(app: FastAPI):
     yield
 
     try:
+        stop_scheduler()
         await kingdee_client.aclose()
         await kingdee_test_client.aclose()
     except Exception:
@@ -80,6 +83,7 @@ async def health():
         "ok": True,
         "service": "union-sf-service",
         "sf_module_enabled": settings.sf_module_enabled,
+        "scheduler": get_scheduler_state(),
     }
 
 
