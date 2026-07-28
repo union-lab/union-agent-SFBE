@@ -1381,6 +1381,7 @@ CARRIER_MAP: dict[str, tuple[str, str, str]] = {
     "1":          ("CP", "1", "1"),     # 顺丰快递
     "1024":       ("JD", "JD", "1"),    # 京东快递/京邦达
     "1058":       ("YTO", "YTO", "1"),  # 圆通快递
+    "1059":       ("YUNDA", "YUNDA", "1"),  # 韵达快递
     "JHFS02_SYS": ("ZT", "ZT", "1"),   # 客户自提
 }
 DEFAULT_CARRIER = ("CP", "1", "1")
@@ -1391,9 +1392,9 @@ CARRIER_REVERSE_MAP: dict[str, str] = {
     "JD":  "1024",        # 京东快递
     "JDKD": "1024",       # 京东快递/京邦达（顺丰回调常用编码）
     "YTO": "1058",        # 圆通快递
-    "ZTO": "1059",        # 中通快递
     "STO": "1060",        # 申通快递
-    "YD":  "1061",        # 韵达快递
+    "YD":  "1059",        # 韵达快递（兼容别名）
+    "YUNDA": "1059",      # 韵达快递（顺丰 WMS 标准编码）
     "ZT":  "JHFS02_SYS",  # 客户自提
 }
 DELIVERY_WAY_CARRIER_MAP: dict[str, str] = {
@@ -1406,6 +1407,8 @@ CARRIER_CN_NAME: dict[str, str] = {
     "YTO": "\u5706\u901a\u5feb\u9012",
     "JD": "\u4eac\u4e1c\u7269\u6d41",
     "JDKD": "\u4eac\u4e1c\u7269\u6d41",
+    "YD": "\u97f5\u8fbe\u5feb\u9012",
+    "YUNDA": "\u97f5\u8fbe\u5feb\u9012",
     "ZT": "\u5ba2\u6237\u81ea\u63d0",
 }
 
@@ -1422,6 +1425,8 @@ def _normalize_carrier_code(carrier_code: str) -> str:
     code = (carrier_code or "").strip().upper()
     if code == "JD":
         return "JDKD"
+    if code == "YD":
+        return "YUNDA"
     return code
 
 
