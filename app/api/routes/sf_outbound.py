@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import timezone, timedelta
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field

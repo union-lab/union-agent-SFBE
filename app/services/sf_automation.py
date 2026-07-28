@@ -21,6 +21,7 @@ import base64
 import html
 import json
 import os
+import re
 import ssl
 import logging
 import xml.etree.ElementTree as ET
@@ -786,7 +787,6 @@ async def retry_single_push(record_id: int) -> dict:
     if not rec:
         return {"success": False, "message": "记录不存在"}
 
-    bill_no = rec["bill_no"]
     bill_type = rec["bill_type"]
 
     kd_user = os.getenv("KINGDEE_SF_USERNAME") or settings.kingdee_username or ""
@@ -1307,8 +1307,6 @@ async def validate_callbacks():
 # ══════════════════════════════════════════════════════════════
 #  出库自动推送（GSP发货通知单 → SALE_ORDER_SERVICE）
 # ══════════════════════════════════════════════════════════════
-
-import re
 
 OUTBOUND_FORM_ID = "SAL_DELIVERYNOTICE"
 OUTBOUND_BILL_TYPE = "outbound"

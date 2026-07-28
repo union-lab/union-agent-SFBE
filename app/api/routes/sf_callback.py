@@ -18,7 +18,7 @@ import base64
 import json
 import logging
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone, timedelta
+from datetime import timezone, timedelta
 
 from fastapi import APIRouter, Request, Response
 

@@ -40,3 +40,11 @@ docker run -d \
   -p 127.0.0.1:8010:8010 \
   union-agent-sfbe:latest
 ```
+
+## CI/CD
+
+- `.github/workflows/ci.yml`：Pull Request 和 `main` 推送执行静态检查、测试与编译检查。
+- `.github/workflows/deploy-production.yml`：业务代码推送到 `main` 后自动部署；也可手动触发。
+- 普通代码变更复用当前生产依赖镜像并覆盖完整 `app`；依赖、锁文件或 Dockerfile 变化时全量构建。
+- 部署脚本不执行数据库 migration 或 SQL；服务自身保持现有运行逻辑。新容器健康检查失败时自动恢复旧容器。
+- 自动部署要求仓库配置 `CVM_HOST`、`CVM_USER`、`CVM_SSH_KEY`，企微通知可选配置 `DEPLOY_WECOM_WEBHOOK`。
