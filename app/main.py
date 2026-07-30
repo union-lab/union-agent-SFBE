@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -82,6 +83,7 @@ async def health():
     return {
         "ok": True,
         "service": "union-sf-service",
+        "release_sha": os.getenv("DEPLOY_SHA", "unknown"),
         "sf_module_enabled": settings.sf_module_enabled,
         "scheduler": get_scheduler_state(),
     }

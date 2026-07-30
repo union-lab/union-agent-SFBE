@@ -28,6 +28,10 @@ from typing import Any
 
 import httpx
 
+from app.clients.kingdee import KingdeeClient
+from app.config import settings
+from app.db.pool import get_pool
+
 # 顺丰 ITEM_SERVICE 不接受 SKU 含汉字/全角字符
 # 例：金蝶里用 "HC0SW0054-禁" 表示停用，推到顺丰会被整批退回
 _HAN_RE = re.compile(r"[\u4e00-\u9fff\uff00-\uffef]")
@@ -35,10 +39,6 @@ _HAN_RE = re.compile(r"[\u4e00-\u9fff\uff00-\uffef]")
 
 def _has_cjk(sku: str) -> bool:
     return bool(_HAN_RE.search(sku or ""))
-
-from app.clients.kingdee import KingdeeClient
-from app.config import settings
-from app.db.pool import get_pool
 
 logger = logging.getLogger("union.sf_item_push")
 

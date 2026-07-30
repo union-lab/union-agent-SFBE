@@ -1,0 +1,307 @@
+# 顺丰独立后端生产部署
+# - push 到 main：测试通过后部署；仅 workflow/文档变更不触发生产
+# - 普通代码变更：基于当前生产镜像覆盖完整 app 目录
+# - 依赖或 Dockerfile 变更：在 CVM 全量构建
+# - 不执行数据库 migration、DDL、DML，也不清理历史镜像
+
+name: Deploy Production
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "*.md"
+      - ".github/workflows/**"
+  workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: "强制全量构建镜像"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sfbe-production-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+
+      - name: Lint
+        run: uv run --frozen ruff check app tests
+
+      - name: Test
+        run: uv run --frozen python -m pytest -q
+
+      - name: Compile
+        run: uv run --frozen python -m compileall -q app
+
+      - name: Select deployment mode
+        id: mode
+        env:
+          FORCE_REBUILD: ${{ inputs.force_rebuild || 'false' }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ "$FORCE_REBUILD" = "true" ]; then
+            echo "rebuild=true" >> "$GITHUB_OUTPUT"
+          else
+            base="$BEFORE_SHA"
+            if ! [[ "$base" =~ ^[0-9a-f]{40}$ ]] || [[ "$base" =~ ^0+$ ]]; then
+              base="$(git rev-parse HEAD^ 2>/dev/null || true)"
+            fi
+            if [ -z "$base" ] || git diff --name-only "$base" "$GITHUB_SHA" -- \
+              pyproject.toml uv.lock Dockerfile .dockerignore | grep -q .; then
+              echo "rebuild=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "rebuild=false" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: Configure SSH
+        env:
+          CVM_HOST: ${{ secrets.CVM_HOST }}
+          CVM_SSH_KEY: ${{ secrets.CVM_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$CVM_HOST"
+          test -n "$CVM_SSH_KEY"
+          mkdir -p ~/.ssh
+          printf '%s\n' "$CVM_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          for attempt in 1 2 3; do
+            if ssh-keyscan -T 30 -H "$CVM_HOST" > ~/.ssh/known_hosts.scan 2>/dev/null; then
+              break
+            fi
+            sleep 5
+          done
+          test -s ~/.ssh/known_hosts.scan
+          cat ~/.ssh/known_hosts.scan >> ~/.ssh/known_hosts
+          rm -f ~/.ssh/known_hosts.scan
+
+      - name: Package source
+        env:
+          ARCHIVE: /tmp/union-agent-sfbe-${{ github.sha }}.tar.gz
+        run: |
+          set -euo pipefail
+          tar czf "$ARCHIVE" \
+            --exclude=.git \
+            --exclude=.venv \
+            --exclude=.pytest_cache \
+            --exclude=.ruff_cache \
+            --exclude=__pycache__ \
+            --exclude='*.pyc' \
+            --exclude='.env*' \
+            .
+
+      - name: Upload source
+        run: |
+          set -euo pipefail
+          scp -i ~/.ssh/deploy_key \
+            "/tmp/union-agent-sfbe-${{ github.sha }}.tar.gz" \
+            "${{ secrets.CVM_USER }}@${{ secrets.CVM_HOST }}:/tmp/union-agent-sfbe-${{ github.sha }}.tar.gz"
+
+      - name: Build and deploy
+        env:
+          DEPLOY_SHA: ${{ github.sha }}
+          REBUILD: ${{ steps.mode.outputs.rebuild }}
+        run: |
+          ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=30 \
+            -i ~/.ssh/deploy_key \
+            "${{ secrets.CVM_USER }}@${{ secrets.CVM_HOST }}" \
+            "DEPLOY_SHA=${DEPLOY_SHA} REBUILD=${REBUILD}" 'bash -s' <<'DEPLOY_SCRIPT'
+          set -euo pipefail
+
+          APP_DIR="/opt/union-agent-sfbe"
+          ENV_FILE="$APP_DIR/.env.production.cutover"
+          CONTAINER="union-SF"
+          ROLLBACK="${CONTAINER}-rollback"
+          DEPLOY_ID="${DEPLOY_SHA:0:12}"
+          IMAGE="union-agent-sfbe:${DEPLOY_SHA:0:7}"
+          ARCHIVE="/tmp/union-agent-sfbe-${DEPLOY_SHA}.tar.gz"
+          BUILD_DIR="/tmp/union-agent-sfbe-build-${DEPLOY_ID}"
+          LOCK_FILE="/tmp/union-sfbe-production-deploy.lock"
+
+          case "$DEPLOY_SHA" in
+            (*[!0-9a-f]*|'') echo "invalid DEPLOY_SHA"; exit 2 ;;
+          esac
+          case "$REBUILD" in
+            true|false) ;;
+            *) echo "REBUILD must be true or false"; exit 2 ;;
+          esac
+          case "$BUILD_DIR" in
+            /tmp/union-agent-sfbe-build-[0-9a-f]*) ;;
+            *) echo "unsafe build directory"; exit 2 ;;
+          esac
+
+          exec 9>"$LOCK_FILE"
+          if ! flock -w 30 9; then
+            echo "another SFBE deployment is running"
+            exit 3
+          fi
+
+          test -s "$ENV_FILE"
+          test -s "$ARCHIVE"
+          if [ "$(docker inspect --format='{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)" != "true" ]; then
+            echo "current union-SF is not running; refuse automatic cutover"
+            exit 4
+          fi
+          if [ "$(docker inspect --format='{{.State.Health.Status}}' "$CONTAINER" 2>/dev/null || true)" != "healthy" ]; then
+            echo "current union-SF is not healthy; refuse automatic cutover"
+            exit 4
+          fi
+
+          cleanup() {
+            rm -rf -- "$BUILD_DIR"
+            rm -f -- "$ARCHIVE"
+          }
+          trap cleanup EXIT
+
+          rm -rf -- "$BUILD_DIR"
+          mkdir -p "$BUILD_DIR"
+          tar xzf "$ARCHIVE" -C "$BUILD_DIR"
+
+          if [ "$REBUILD" = "true" ]; then
+            echo "mode=full-rebuild image=$IMAGE"
+            timeout --foreground 1200 docker build --progress=plain \
+              --label "org.opencontainers.image.revision=$DEPLOY_SHA" \
+              -t "$IMAGE" "$BUILD_DIR"
+          else
+            BASE_IMAGE="$(docker inspect --format='{{.Config.Image}}' "$CONTAINER")"
+            test -n "$BASE_IMAGE"
+            echo "mode=fast-overlay base=$BASE_IMAGE image=$IMAGE"
+            cat > "$BUILD_DIR/Dockerfile.fast" <<'FAST_DOCKERFILE'
+          ARG BASE_IMAGE
+          FROM ${BASE_IMAGE}
+          ARG DEPLOY_SHA
+          COPY --chown=1001:1001 app /app/app
+          LABEL org.opencontainers.image.revision=${DEPLOY_SHA}
+          FAST_DOCKERFILE
+            timeout --foreground 600 docker build --progress=plain \
+              -f "$BUILD_DIR/Dockerfile.fast" \
+              --build-arg "BASE_IMAGE=$BASE_IMAGE" \
+              --build-arg "DEPLOY_SHA=$DEPLOY_SHA" \
+              -t "$IMAGE" "$BUILD_DIR"
+          fi
+
+          docker run --rm --network none --entrypoint python "$IMAGE" -c \
+            "from app.main import app; assert app.title == 'Union SF Service'"
+
+          if docker inspect "$ROLLBACK" >/dev/null 2>&1; then
+            if [ "$(docker inspect --format='{{.State.Running}}' "$ROLLBACK")" = "true" ]; then
+              echo "rollback container is unexpectedly running; refuse cutover"
+              exit 5
+            fi
+            docker rm "$ROLLBACK" >/dev/null
+          fi
+
+          docker stop --time 30 "$CONTAINER" >/dev/null
+          docker rename "$CONTAINER" "$ROLLBACK"
+
+          rollback() {
+            docker stop --time 10 "$CONTAINER" >/dev/null 2>&1 || true
+            docker rm "$CONTAINER" >/dev/null 2>&1 || true
+            if docker inspect "$ROLLBACK" >/dev/null 2>&1; then
+              docker rename "$ROLLBACK" "$CONTAINER"
+              docker start "$CONTAINER" >/dev/null
+            fi
+          }
+
+          if ! docker run -d \
+            --name "$CONTAINER" \
+            --restart unless-stopped \
+            --memory 1g \
+            --memory-swap 1g \
+            --add-host host.docker.internal:host-gateway \
+            --env-file "$ENV_FILE" \
+            -e "DEPLOY_SHA=$DEPLOY_SHA" \
+            -p 127.0.0.1:8010:8010 \
+            --log-driver json-file \
+            --log-opt max-size=10m \
+            --log-opt max-file=3 \
+            "$IMAGE" >/dev/null; then
+            rollback
+            exit 6
+          fi
+
+          HEALTH_OK=0
+          for attempt in $(seq 1 30); do
+            body="$(curl -fsS http://127.0.0.1:8010/health 2>/dev/null || true)"
+            if HEALTH_BODY="$body" EXPECTED_SHA="$DEPLOY_SHA" python3 - <<'PY'
+          import json
+          import os
+
+          try:
+              payload = json.loads(os.environ["HEALTH_BODY"])
+          except Exception:
+              raise SystemExit(1)
+          if payload.get("ok") is not True:
+              raise SystemExit(1)
+          if payload.get("release_sha") != os.environ["EXPECTED_SHA"]:
+              raise SystemExit(1)
+          if payload.get("scheduler", {}).get("running") is not True:
+              raise SystemExit(1)
+          PY
+            then
+              HEALTH_OK=1
+              break
+            fi
+            sleep 2
+          done
+
+          if [ "$HEALTH_OK" != "1" ]; then
+            docker logs --tail 120 "$CONTAINER" 2>&1 || true
+            rollback
+            exit 7
+          fi
+
+          echo "deployment_ok image=$IMAGE rollback=$ROLLBACK"
+          docker inspect "$CONTAINER" --format \
+            'status={{.State.Status}} health={{.State.Health.Status}} restarts={{.RestartCount}} image={{.Config.Image}}'
+          DEPLOY_SCRIPT
+
+      - name: Notify WeCom
+        if: always()
+        env:
+          WEBHOOK: ${{ secrets.DEPLOY_WECOM_WEBHOOK }}
+          STATUS: ${{ job.status }}
+          SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$WEBHOOK" ]; then
+            exit 0
+          fi
+          python3 - <<'PY' | curl -fsS -X POST "$WEBHOOK" -H 'Content-Type: application/json' --data-binary @-
+          import json
+          import os
+
+          status = os.environ["STATUS"]
+          text = (
+              f"{'✅' if status == 'success' else '❌'} union-agent-SFBE 部署{status}\n"
+              f"版本: {os.environ['SHA']}\n"
+              f"详情: {os.environ['RUN_URL']}"
+          )
+          print(json.dumps({"msgtype": "text", "text": {"content": text}}, ensure_ascii=False))
+          PY
+
+      - name: Cleanup runner
+        if: always()
+        run: |
+          rm -f ~/.ssh/deploy_key "/tmp/union-agent-sfbe-${{ github.sha }}.tar.gz"
