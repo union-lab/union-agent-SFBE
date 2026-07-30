@@ -8,10 +8,10 @@ from app.services.sf_automation import (
 
 
 def test_yunda_uses_confirmed_kingdee_delivery_way() -> None:
-    assert CARRIER_MAP["1059"] == ("YUNDA", "YUNDA", "1")
-    assert CARRIER_REVERSE_MAP["YUNDA"] == "1059"
-    assert CARRIER_REVERSE_MAP["YD"] == "1059"
-    assert DELIVERY_WAY_CARRIER_MAP["1059"] == "YUNDA"
+    assert CARRIER_MAP["2"] == ("YUNDA", "YUNDA", "1")
+    assert CARRIER_REVERSE_MAP["YUNDA"] == "2"
+    assert CARRIER_REVERSE_MAP["YD"] == "2"
+    assert DELIVERY_WAY_CARRIER_MAP["2"] == "YUNDA"
 
 
 def test_yunda_alias_is_normalized_and_named() -> None:
@@ -22,4 +22,4 @@ def test_yunda_alias_is_normalized_and_named() -> None:
 
 
 def test_zhongtong_does_not_reuse_yunda_delivery_way() -> None:
-    assert CARRIER_REVERSE_MAP.get("ZTO") != "1059"
+    assert CARRIER_REVERSE_MAP.get("ZTO") != "2"
