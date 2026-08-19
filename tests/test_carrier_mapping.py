@@ -5,6 +5,7 @@ from app.services.sf_automation import (
     DELIVERY_WAY_CARRIER_MAP,
     _normalize_carrier_code,
 )
+from app.services.sf_outbound import CARRIERS
 
 
 def test_yunda_uses_confirmed_kingdee_delivery_way() -> None:
@@ -23,3 +24,11 @@ def test_yunda_alias_is_normalized_and_named() -> None:
 
 def test_zhongtong_does_not_reuse_yunda_delivery_way() -> None:
     assert CARRIER_REVERSE_MAP.get("ZTO") != "2"
+
+
+def test_zhongtong_uses_confirmed_kingdee_delivery_way() -> None:
+    assert CARRIER_MAP["1065"] == ("ZTO", "ZTO", "1")
+    assert CARRIER_REVERSE_MAP["ZTO"] == "1065"
+    assert DELIVERY_WAY_CARRIER_MAP["1065"] == "ZTO"
+    assert CARRIER_CN_NAME["ZTO"] == "中通快递"
+    assert CARRIERS["ZTO"].products[0].code == "ZTO"
