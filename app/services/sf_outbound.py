@@ -62,9 +62,15 @@ CARRIERS: dict[str, Carrier] = {
             CarrierProduct("ZT", "自提", "客户到仓自提，不产生运费"),
         ],
     ),
+    "ZTO": Carrier(
+        code="ZTO",
+        name="中通快递",
+        products=[
+            CarrierProduct("ZTO", "中通快递", "中通快递"),
+        ],
+    ),
     # 以下为预留，编码需跟顺丰仓确认后启用
     # "YTO": Carrier(code="YTO", name="圆通速递", products=[...]),
-    # "ZTO": Carrier(code="ZTO", name="中通快递", products=[...]),
     # "JD": Carrier(code="JD", name="京东物流", products=[...]),
 }
 
