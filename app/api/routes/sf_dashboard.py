@@ -71,12 +71,15 @@ ABNORMAL_STATUSES = (
 
 BILL_TYPE_LABELS = {
     "transfer": "直接调拨单",
+    "transfer_out": "直接调拨单（出库）",
     "transfer_in": "分布式调入单",
+    "transfer_in_out": "分布式调入单（出库）",
     "purchase_in": "采购入库单",
     "outbound": "GSP发货通知单",
 }
 
 INBOUND_BILL_TYPES = {"transfer", "transfer_in", "purchase_in"}
+OUTBOUND_BILL_TYPES = {"outbound", "transfer_out", "transfer_in_out"}
 
 CARRIER_NAME_MAP = {
     "CP": "顺丰速运",
@@ -369,9 +372,32 @@ async def cancel_record(record_id: int, body: CancelRequest | None = None):
     erp_order = rec["erp_order"]
 
     try:
-        if bill_type == "outbound":
-            from app.services.sf_outbound import cancel_outbound_order
-            result = await cancel_outbound_order(erp_order, rec.get("sf_receipt_id") or "")
+        if bill_type in OUTBOUND_BILL_TYPES:
+            from app.services.sf_outbound import (
+                cancel_outbound_order,
+                query_outbound_status,
+            )
+
+            # 页面状态可能落后于顺丰。先做只读查询；若顺丰已经取消，直接按幂等成功
+            # 回写本地状态，避免再次取消返回“订单已取消”后页面仍卡在“已推送”。
+            live_status = None
+            try:
+                live_status = await query_outbound_status(erp_order)
+            except Exception as e:
+                logger.warning("取消前查询顺丰状态失败，继续调用取消接口: %s %s", erp_order, e)
+
+            live_raw = live_status.get("raw", "") if isinstance(live_status, dict) else ""
+            live_header = _parse_wms_header(live_raw)
+            if (
+                isinstance(live_status, dict)
+                and live_status.get("head") == "OK"
+                and live_header.get("OrderStatus") == "1400"
+            ):
+                result = {"success": True, "raw": live_raw, "already_cancelled": True}
+            else:
+                result = await cancel_outbound_order(
+                    erp_order, rec.get("sf_receipt_id") or ""
+                )
         elif bill_type in INBOUND_BILL_TYPES:
             from app.services.sf_automation import _sf_xml, _sf_send
             cancel_body = (
@@ -413,7 +439,10 @@ async def cancel_record(record_id: int, body: CancelRequest | None = None):
             """UPDATE ads_sf_push_record
                SET status = 'cancelled',
                    error_message = $1,
+                   cancel_reason = $1,
                    sf_response = COALESCE(NULLIF($2, ''), sf_response),
+                   sf_wms_status = '1400',
+                   sf_wms_status_text = '已取消',
                    cancelled_at = now(),
                    updated_at = now()
                WHERE id = $3""",
@@ -460,7 +489,7 @@ async def get_wms_status(record_id: int):
         )
     if not rec:
         raise HTTPException(404, "记录不存在")
-    if rec["bill_type"] != "outbound":
+    if rec["bill_type"] not in OUTBOUND_BILL_TYPES:
         raise HTTPException(400, "仅出库单支持 WMS 状态查询")
 
     from app.services.sf_outbound import query_outbound_status
@@ -489,6 +518,24 @@ async def get_wms_status(record_id: int):
                    waybill_no = COALESCE(NULLIF($3, ''), waybill_no),
                    carrier_code = COALESCE(NULLIF($4, ''), carrier_code),
                    carrier_name = COALESCE(NULLIF($5, ''), carrier_name),
+                   status = CASE
+                       WHEN $1 = '1400'
+                            AND status NOT IN ('outstock_created', 'outstock_created_no_callback')
+                       THEN 'cancelled'
+                       ELSE status
+                   END,
+                   cancelled_at = CASE
+                       WHEN $1 = '1400'
+                            AND status NOT IN ('outstock_created', 'outstock_created_no_callback')
+                       THEN COALESCE(cancelled_at, now())
+                       ELSE cancelled_at
+                   END,
+                   cancel_reason = CASE
+                       WHEN $1 = '1400'
+                            AND status NOT IN ('outstock_created', 'outstock_created_no_callback')
+                       THEN COALESCE(cancel_reason, '顺丰WMS状态同步：已取消')
+                       ELSE cancel_reason
+                   END,
                    updated_at = now()
                WHERE id = $6""",
             current_status, current_text, waybill, carrier, carrier_name, record_id,
@@ -621,7 +668,7 @@ async def sync_wms_status_batch(limit: int = 30, only_empty: bool = True) -> dic
         rows = await conn.fetch(
             f"""
             SELECT id, bill_no, status, sf_wms_status_text FROM ads_sf_push_record
-            WHERE bill_type = 'outbound'
+            WHERE bill_type = ANY($1::text[])
               AND status IN ('success', 'callback_ok', 'outstock_created',
                              'callback_mismatch', 'timeout_alert')
               AND created_at > NOW() - INTERVAL '14 days'
@@ -629,9 +676,9 @@ async def sync_wms_status_batch(limit: int = 30, only_empty: bool = True) -> dic
             ORDER BY
               (sf_wms_status_text IS NULL OR sf_wms_status_text = '') DESC,
               created_at DESC
-            LIMIT $1
+            LIMIT $2
             """,
-            limit,
+            sorted(OUTBOUND_BILL_TYPES), limit,
         )
 
     if not rows:
@@ -671,6 +718,24 @@ async def sync_wms_status_batch(limit: int = 30, only_empty: bool = True) -> dic
                         waybill_no = COALESCE(NULLIF($3, ''), waybill_no),
                         carrier_code = COALESCE(NULLIF($4, ''), carrier_code),
                         carrier_name = COALESCE(NULLIF($5, ''), carrier_name),
+                        status = CASE
+                            WHEN $1 = '1400'
+                                 AND status NOT IN ('outstock_created', 'outstock_created_no_callback')
+                            THEN 'cancelled'
+                            ELSE status
+                        END,
+                        cancelled_at = CASE
+                            WHEN $1 = '1400'
+                                 AND status NOT IN ('outstock_created', 'outstock_created_no_callback')
+                            THEN COALESCE(cancelled_at, now())
+                            ELSE cancelled_at
+                        END,
+                        cancel_reason = CASE
+                            WHEN $1 = '1400'
+                                 AND status NOT IN ('outstock_created', 'outstock_created_no_callback')
+                            THEN COALESCE(cancel_reason, '顺丰WMS状态同步：已取消')
+                            ELSE cancel_reason
+                        END,
                         updated_at = now()
                     WHERE id = $6
                     """,
