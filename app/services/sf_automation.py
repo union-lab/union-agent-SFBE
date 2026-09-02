@@ -1560,6 +1560,10 @@ async def sync_sale_order_waybill_from_outstock(
             await kingdee.save("SAL_SaleOrder", {
                 "NeedUpDateFields": ["F_YLYL_Text9"],
                 "IsDeleteEntry": "false",
+                # 销售订单已审核且已完成出库后，Save 会重跑所有旧分录的可出数量校验；
+                # 本调用只写表头文本字段，不传分录/数量/状态，关闭该无关校验以允许回填。
+                "ValidateFlag": "false",
+                "IsVerifyBaseDataField": "false",
                 "Model": {
                     "FID": sale_order_id,
                     "F_YLYL_Text9": target_waybill,

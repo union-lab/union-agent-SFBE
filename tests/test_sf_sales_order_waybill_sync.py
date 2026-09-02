@@ -60,11 +60,15 @@ def test_sync_sale_order_waybill_updates_only_empty_source_orders() -> None:
         ("SAL_SaleOrder", {
             "NeedUpDateFields": ["F_YLYL_Text9"],
             "IsDeleteEntry": "false",
+            "ValidateFlag": "false",
+            "IsVerifyBaseDataField": "false",
             "Model": {"FID": 496406, "F_YLYL_Text9": "SF6048643216347"},
         }),
         ("SAL_SaleOrder", {
             "NeedUpDateFields": ["F_YLYL_Text9"],
             "IsDeleteEntry": "false",
+            "ValidateFlag": "false",
+            "IsVerifyBaseDataField": "false",
             "Model": {"FID": 496407, "F_YLYL_Text9": "SF6048643216347"},
         }),
     ]
