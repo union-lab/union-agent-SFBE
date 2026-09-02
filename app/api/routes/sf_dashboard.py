@@ -478,6 +478,27 @@ async def retry_record(record_id: int):
     return result
 
 
+@router.post("/records/{record_id}/sync-sale-order-waybill")
+async def sync_sale_order_waybill(record_id: int):
+    """定向补偿一条顺丰记录对应销售订单的快递单号。
+
+    仅回填销售订单 `F_YLYL_Text9` 的空值；已有不同值时返回冲突，不覆盖。
+    不触发反审核、删除、库存、出库单或应收单操作。
+    """
+    from app.services.sf_automation import sync_sale_order_waybill_for_record
+
+    try:
+        result = await sync_sale_order_waybill_for_record(record_id)
+    except Exception as e:
+        logger.exception("销售订单快递单号定向回写异常: record_id=%d", record_id)
+        raise HTTPException(502, f"金蝶销售订单快递单号回写失败: {e}")
+
+    if not result.get("success"):
+        message = result.get("message") or "金蝶销售订单快递单号回写失败"
+        raise HTTPException(400, message)
+    return result
+
+
 @router.get("/records/{record_id}/wms-status")
 async def get_wms_status(record_id: int):
     """实时查询顺丰 WMS 作业状态（调用 SALE_ORDER_STATUS_QUERY_SERVICE）"""

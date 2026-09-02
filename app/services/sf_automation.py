@@ -1452,6 +1452,194 @@ def _resolve_carrier_from_outstock(waybill_no: str, delivery_way_code: str) -> s
     )
 
 
+def _k3_filter_literal(value: str) -> str:
+    """转义 K3 ExecuteBillQuery 筛选字符串中的单引号。"""
+    return str(value or "").replace("'", "''")
+
+
+async def sync_sale_order_waybill_from_outstock(
+    kingdee: KingdeeClient,
+    outstock_no: str,
+    waybill_no: str = "",
+    *,
+    log_prefix: str,
+) -> dict:
+    """将 XSCK 的顺丰运单号回写到来源销售订单的“快递单号”。
+
+    只补空值：销售订单已经有其他运单号时保留原值并记录冲突，绝不覆盖。
+    不执行提交、审核、反审核，也不改出库/库存/应收单状态。
+    """
+    result = {
+        "outstock_no": outstock_no,
+        "waybill_no": (waybill_no or "").strip(),
+        "source_orders": [],
+        "updated": [],
+        "already_synced": [],
+        "conflicts": [],
+        "failed": [],
+    }
+    if not outstock_no:
+        result["failed"].append({"reason": "缺少销售出库单号"})
+        return result
+
+    try:
+        outstock_rows = await kingdee.query(
+            "SAL_OUTSTOCK",
+            "FSoorDerno,FCarriageNO",
+            filter_string=f"FBillNo = '{_k3_filter_literal(outstock_no)}'",
+            limit=2000,
+        )
+    except Exception as e:
+        result["failed"].append({"reason": f"读取销售出库单来源失败: {e}"})
+        logger.warning("%s: 读取 XSCK 来源销售订单失败 %s: %s", log_prefix, outstock_no, e)
+        return result
+
+    source_orders: list[str] = []
+    for row in outstock_rows or []:
+        if not isinstance(row, list):
+            continue
+        source_no = str(row[0]).strip() if row and row[0] else ""
+        if source_no and source_no not in source_orders:
+            source_orders.append(source_no)
+        if not result["waybill_no"] and len(row) > 1 and row[1]:
+            result["waybill_no"] = str(row[1]).strip()
+
+    result["source_orders"] = source_orders
+    if not source_orders:
+        result["failed"].append({"reason": "销售出库单未找到来源销售订单"})
+        logger.warning("%s: XSCK %s 未找到来源销售订单", log_prefix, outstock_no)
+        return result
+    if not result["waybill_no"]:
+        result["failed"].append({"reason": "销售出库单和推送记录均无运单号"})
+        logger.warning("%s: XSCK %s 无运单号，跳过销售订单回写", log_prefix, outstock_no)
+        return result
+
+    for sale_order_no in source_orders:
+        try:
+            sale_order_rows = await kingdee.query(
+                "SAL_SaleOrder",
+                "FID,FBillNo,FDocumentStatus,F_YLYL_Text9",
+                filter_string=f"FBillNo = '{_k3_filter_literal(sale_order_no)}'",
+                limit=1,
+            )
+        except Exception as e:
+            result["failed"].append({"sale_order_no": sale_order_no, "reason": f"读取销售订单失败: {e}"})
+            logger.warning("%s: 读取销售订单失败 %s: %s", log_prefix, sale_order_no, e)
+            continue
+
+        if not sale_order_rows or not isinstance(sale_order_rows[0], list):
+            result["failed"].append({"sale_order_no": sale_order_no, "reason": "销售订单不存在"})
+            logger.warning("%s: 未找到销售订单 %s", log_prefix, sale_order_no)
+            continue
+
+        sale_order = sale_order_rows[0]
+        try:
+            sale_order_id = int(sale_order[0])
+        except (IndexError, TypeError, ValueError):
+            result["failed"].append({"sale_order_no": sale_order_no, "reason": "销售订单 FID 无效"})
+            logger.warning("%s: 销售订单 %s 的 FID 无效", log_prefix, sale_order_no)
+            continue
+        current_waybill = str(sale_order[3]).strip() if len(sale_order) > 3 and sale_order[3] else ""
+        target_waybill = result["waybill_no"]
+        if current_waybill == target_waybill:
+            result["already_synced"].append(sale_order_no)
+            continue
+        if current_waybill:
+            result["conflicts"].append({
+                "sale_order_no": sale_order_no,
+                "current_waybill": current_waybill,
+                "target_waybill": target_waybill,
+            })
+            logger.warning(
+                "%s: 销售订单 %s 已有不同运单号 %s，保留原值，不覆盖 %s",
+                log_prefix, sale_order_no, current_waybill, target_waybill,
+            )
+            continue
+
+        try:
+            await kingdee.save("SAL_SaleOrder", {
+                "NeedUpDateFields": ["F_YLYL_Text9"],
+                "IsDeleteEntry": "false",
+                "Model": {
+                    "FID": sale_order_id,
+                    "F_YLYL_Text9": target_waybill,
+                },
+            })
+            result["updated"].append(sale_order_no)
+            logger.info(
+                "%s: 销售订单快递单号已回写 %s ← %s（来源 XSCK %s）",
+                log_prefix, sale_order_no, target_waybill, outstock_no,
+            )
+        except Exception as e:
+            result["failed"].append({"sale_order_no": sale_order_no, "reason": f"回写失败: {e}"})
+            logger.warning(
+                "%s: 销售订单快递单号回写失败 %s ← %s（不影响出库主流程）: %s",
+                log_prefix, sale_order_no, target_waybill, e,
+            )
+
+    return result
+
+
+async def sync_sale_order_waybill_for_record(record_id: int) -> dict:
+    """按中控推送记录定向补偿销售订单快递单号，不做历史批量回填。"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        record = await conn.fetchrow(
+            """SELECT id, bill_no, bill_type, outstock_no, waybill_no
+               FROM ads_sf_push_record WHERE id = $1""",
+            record_id,
+        )
+    if not record:
+        return {"success": False, "message": "推送记录不存在"}
+    if record["bill_type"] != OUTBOUND_BILL_TYPE:
+        return {"success": False, "message": "仅 GSP 发货通知单支持销售订单快递单号回写"}
+    if not record["outstock_no"]:
+        return {"success": False, "message": "该记录尚未生成销售出库单"}
+
+    kd_user = os.getenv("KINGDEE_SF_USERNAME") or settings.kingdee_username or ""
+    kd_pass = os.getenv("KINGDEE_SF_PASSWORD") or settings.kingdee_password or ""
+    kingdee = KingdeeClient(username=kd_user, password=kd_pass)
+    await kingdee.login()
+    result = await sync_sale_order_waybill_from_outstock(
+        kingdee,
+        str(record["outstock_no"]),
+        str(record["waybill_no"] or ""),
+        log_prefix=f"中控定向回写 {record['bill_no']}",
+    )
+    result["record_id"] = record_id
+    result["bill_no"] = record["bill_no"]
+    result["success"] = not result["failed"]
+    return result
+
+
+async def _try_sync_sale_order_waybill_from_outstock(
+    kingdee: KingdeeClient,
+    outstock_no: str,
+    waybill_no: str,
+    *,
+    log_prefix: str,
+) -> dict:
+    """出库主流程调用的安全包装：销售订单回写失败不能影响出库。"""
+    try:
+        result = await sync_sale_order_waybill_from_outstock(
+            kingdee, outstock_no, waybill_no, log_prefix=log_prefix,
+        )
+        if result["failed"]:
+            logger.warning("%s: 销售订单快递单号未完全回写: %s", log_prefix, result["failed"])
+        return result
+    except Exception as e:
+        logger.exception("%s: 销售订单快递单号回写异常（不影响出库主流程）: %s", log_prefix, e)
+        return {
+            "outstock_no": outstock_no,
+            "waybill_no": waybill_no,
+            "source_orders": [],
+            "updated": [],
+            "already_synced": [],
+            "conflicts": [],
+            "failed": [{"reason": f"未预期异常: {e}"}],
+        }
+
+
 async def _sync_push_record_logistics_from_outstock(
     pool,
     kingdee: KingdeeClient,
@@ -2256,6 +2444,10 @@ async def _create_kingdee_outstock_locked(
             )
 
             if doc_status == "C":
+                await _try_sync_sale_order_waybill_from_outstock(
+                    kingdee, outstock_no, waybill_no,
+                    log_prefix="已审核XSCK销售订单快递单号回写",
+                )
                 async with pool.acquire() as conn:
                     await conn.execute(
                         f"""UPDATE ads_sf_push_record
@@ -2278,6 +2470,10 @@ async def _create_kingdee_outstock_locked(
                 "IsVerifyProcInst": "false",
             })
             logger.info("补 Audit 成功: %s", outstock_no)
+            await _try_sync_sale_order_waybill_from_outstock(
+                kingdee, outstock_no, waybill_no,
+                log_prefix="补审核XSCK销售订单快递单号回写",
+            )
             async with pool.acquire() as conn:
                 await conn.execute(
                     f"""UPDATE ads_sf_push_record
@@ -2328,6 +2524,10 @@ async def _create_kingdee_outstock_locked(
             "IsVerifyProcInst": "false",
         })
         logger.info("Audit 成功: %s → %s", outstock_no, audit_result)
+        await _try_sync_sale_order_waybill_from_outstock(
+            kingdee, outstock_no, waybill_no,
+            log_prefix="新建XSCK销售订单快递单号回写",
+        )
 
         # 更新记录
         async with pool.acquire() as conn:
@@ -2370,6 +2570,10 @@ async def _create_kingdee_outstock_locked(
                     pool, kingdee, record_id, already_no,
                     log_prefix="已审核XSCK物流回灌",
                 )
+                await _try_sync_sale_order_waybill_from_outstock(
+                    kingdee, already_no, waybill_no,
+                    log_prefix="幂等已审核XSCK销售订单快递单号回写",
+                )
             async with pool.acquire() as conn:
                 await conn.execute(
                     f"""UPDATE ads_sf_push_record
@@ -2405,6 +2609,10 @@ async def _create_kingdee_outstock_locked(
                                 pool, kingdee, record_id, err_xb,
                                 log_prefix="Submit幂等XSCK物流回灌",
                             )
+                            await _try_sync_sale_order_waybill_from_outstock(
+                                kingdee, err_xb, waybill_no,
+                                log_prefix="Submit幂等XSCK销售订单快递单号回写",
+                            )
                             async with pool.acquire() as conn:
                                 await conn.execute(
                                     f"""UPDATE ads_sf_push_record
@@ -2426,6 +2634,10 @@ async def _create_kingdee_outstock_locked(
                                 await _sync_push_record_logistics_from_outstock(
                                     pool, kingdee, record_id, err_xb,
                                     log_prefix="补Audit后XSCK物流回灌",
+                                )
+                                await _try_sync_sale_order_waybill_from_outstock(
+                                    kingdee, err_xb, waybill_no,
+                                    log_prefix="补Audit后XSCK销售订单快递单号回写",
                                 )
                                 async with pool.acquire() as conn:
                                     await conn.execute(
