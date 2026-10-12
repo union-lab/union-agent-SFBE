@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import xml.etree.ElementTree as ET
@@ -15,6 +16,7 @@ from pydantic import BaseModel
 
 from app.db.pool import get_pool, row_to_dict
 from app.services import sf_item_push
+from app.services.sf_wms_polling import WmsPollQueue
 
 router = APIRouter(prefix="/api/sf/dashboard", tags=["顺丰中控平台"])
 logger = logging.getLogger("union")
@@ -641,67 +643,70 @@ def _get_sf_warehouse_code() -> str:
 # ──────────────────────────────────────────────
 
 # WMS 终态：已出库、已取消 — 这些不需要再刷新
-_WMS_TERMINAL_TEXTS = {'已出库', '已发货', '已取消'}
+_wms_poll_queue = WmsPollQueue()
+_wms_poll_lock = asyncio.Lock()
 
 async def sync_wms_status_batch(limit: int = 30, only_empty: bool = True) -> dict:
+    # 手动同步与定时同步共用轮转状态，避免重叠批次打破限流。
+    if not 1 <= limit <= 200:
+        raise ValueError("WMS 查询批量必须在 1 到 200 之间")
+    if _wms_poll_lock.locked():
+        logger.info("WMS 状态同步: 上一批尚未结束，本轮跳过")
+        return {"total": 0, "success": 0, "failed": 0, "skipped": 0, "busy": True}
+    async with _wms_poll_lock:
+        return await _sync_wms_status_batch(limit, only_empty)
+
+
+async def _sync_wms_status_batch(limit: int, only_empty: bool) -> dict:
     """批量调顺丰 STATUS_QUERY,把 WMS 状态回写到 ads_sf_push_record
 
-    扫描优先级：
-    1. sf_wms_status_text 为空的记录 → 首次填入
-    2. status='success' 且 WMS 不是终态（已出库/已取消）且超过 10 分钟没更新 → 推进进度
-       这些记录需要定期刷新，直到 WMS 变成"已出库"后由 validate_outbound_callbacks 的
-       WMS兜底逻辑自动创建金蝶出库单
-    3. only_empty=False 时：所有非终态 + 超过 2 小时没更新的也刷
+    按最久未查询优先轮转，首次查询按创建时间从旧到新。
+    非终态重查间隔 10 分钟，手动复检终态间隔 2 小时。
+    查询失败也计入轮转，其他业务写入 updated_at 不延后非终态查询。
 
     内置限流(每次调用间隔 1.1s),避免触发顺丰 60次/分 限频
     """
-    import asyncio
     from app.services.sf_outbound import query_outbound_status
 
     pool = await get_pool()
 
     # 构建 WHERE 子句：空值 + 非终态刷新
     if only_empty:
-        # 优先刷空值，然后刷 success 状态中 WMS 非终态（需要推进的记录）
+        # 只筛业务候选；冷却和批量截断在独立查询时钟上进行。
         where_stale = (
             "AND ("
             "  (sf_wms_status_text IS NULL OR sf_wms_status_text = '')"
             "  OR ("
             "    status IN ('success', 'timeout_alert')"
             "    AND sf_wms_status_text NOT IN ('已出库', '已发货', '已取消')"
-            "    AND updated_at < NOW() - INTERVAL '10 minutes'"
             "  )"
             ")"
         )
     else:
-        where_stale = (
-            "AND ("
-            "  (sf_wms_status_text IS NULL OR sf_wms_status_text = '')"
-            "  OR ("
-            "    sf_wms_status_text NOT IN ('已出库', '已发货', '已取消')"
-            "    AND updated_at < NOW() - INTERVAL '10 minutes'"
-            "  )"
-            "  OR updated_at < NOW() - INTERVAL '2 hours'"
-            ")"
-        )
+        where_stale = ""
 
     async with pool.acquire() as conn:
-        rows = await conn.fetch(
+        candidates = await conn.fetch(
             f"""
-            SELECT id, bill_no, status, sf_wms_status_text FROM ads_sf_push_record
+            SELECT id, bill_no, status, sf_wms_status_text, created_at, updated_at
+            FROM ads_sf_push_record
             WHERE bill_type = ANY($1::text[])
               AND status IN ('success', 'callback_ok', 'outstock_created',
                              'callback_mismatch', 'timeout_alert')
               AND created_at > NOW() - INTERVAL '14 days'
               {where_stale}
-            ORDER BY
-              (sf_wms_status_text IS NULL OR sf_wms_status_text = '') DESC,
-              created_at DESC
-            LIMIT $2
+            ORDER BY created_at ASC, id ASC
             """,
-            sorted(OUTBOUND_BILL_TYPES), limit,
+            sorted(OUTBOUND_BILL_TYPES),
         )
 
+    rows, due_count = _wms_poll_queue.select(
+        candidates, limit=limit, now=datetime.now(timezone.utc),
+    )
+    logger.info(
+        "WMS 查询轮转: 候选%d 到期%d 本批%d 待后续%d",
+        len(candidates), due_count, len(rows), due_count - len(rows),
+    )
     if not rows:
         return {"total": 0, "success": 0, "failed": 0, "skipped": 0}
 
@@ -714,7 +719,7 @@ async def sync_wms_status_batch(limit: int = 30, only_empty: bool = True) -> dic
             result = await query_outbound_status(r["bill_no"])
             if result.get("head") != "OK":
                 failed += 1
-                await asyncio.sleep(1.1)
+                logger.warning("WMS 状态同步 %s: 接口未返回 OK", r["bill_no"])
                 continue
 
             raw_xml = result.get("raw", "")
@@ -722,7 +727,7 @@ async def sync_wms_status_batch(limit: int = 30, only_empty: bool = True) -> dic
             current_status = header.get("OrderStatus", "")
             if not current_status:
                 skipped += 1
-                await asyncio.sleep(1.1)
+                logger.warning("WMS 状态同步 %s: 响应缺少订单状态", r["bill_no"])
                 continue
 
             current_text = WMS_STATUS_MAP.get(current_status, f"未知({current_status})")
@@ -763,11 +768,18 @@ async def sync_wms_status_batch(limit: int = 30, only_empty: bool = True) -> dic
                     current_status, current_text, waybill, carrier, carrier_name, r["id"],
                 )
             success += 1
+            logger.info(
+                "WMS 状态同步 %s: %s -> %s, WMS完成时间=%s",
+                r["bill_no"], r["sf_wms_status_text"], current_text,
+                header.get("WmsCompleteTime", ""),
+            )
         except Exception as e:
             logger.warning("WMS 状态同步 %s 失败: %s", r["bill_no"], e)
             failed += 1
 
-        await asyncio.sleep(1.1)
+        finally:
+            _wms_poll_queue.mark_attempt(r["id"], datetime.now(timezone.utc))
+            await asyncio.sleep(1.1)
 
     return {
         "total": len(rows),
