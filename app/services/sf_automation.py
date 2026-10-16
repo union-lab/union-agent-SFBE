@@ -24,6 +24,7 @@ import os
 import re
 import ssl
 import logging
+import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 
@@ -2330,23 +2331,30 @@ async def _create_kingdee_outstock(
       导致金蝶里产生 2~4 张重复 XSCK（阿潘 4/22 事故根因：54 张 FHTZ 被重复下推）
     """
     pool = await get_pool()
-    # 按 bill_no 哈希成一个 int8 给 advisory_lock
-    # pg_try_advisory_lock 非阻塞；如果锁已被同事务持有就立即返回 False → 跳过本轮
-    lock_key = abs(hash(f"sf_outstock:{bill_no}")) % (2**31)
+    # Python hash 随进程变化；事务锁必须和整次建单持有同一连接，
+    # 不能借出连接取锁后立即归还（池 reset 会释放会话锁）。
+    lock_key = int.from_bytes(
+        hashlib.sha256(f"sf_outstock:{bill_no}".encode()).digest()[:8],
+        "big", signed=True,
+    )
     async with pool.acquire() as conn:
-        got_lock = await conn.fetchval("SELECT pg_try_advisory_lock($1)", lock_key)
-        if not got_lock:
-            logger.warning("⏭ %s 正在被其他协程处理，跳过本轮（并发保护）", bill_no)
-            return None
-    try:
-        return await _create_kingdee_outstock_locked(
-            bill_no, fhtz_fid, record_id, waybill_no, lock_key,
-            via_wms_fallback=via_wms_fallback,
-            actual_carrier=actual_carrier,
-        )
-    finally:
-        async with pool.acquire() as conn:
-            await conn.execute("SELECT pg_advisory_unlock($1)", lock_key)
+        async with conn.transaction():
+            got_lock = await conn.fetchval("SELECT pg_try_advisory_xact_lock($1)", lock_key)
+            if not got_lock:
+                logger.warning("⏭ %s 正在被其他协程处理，跳过本轮（并发保护）", bill_no)
+                return None
+            current = await conn.fetchval(
+                "SELECT status FROM ads_sf_push_record WHERE id = $1 AND bill_no = $2",
+                record_id, bill_no,
+            )
+            if current not in ("success", "callback_ok", "timeout_alert", "duplicate_outstock"):
+                logger.info("跳过状态已变化的建单任务 %s: %s", bill_no, current)
+                return None
+            return await _create_kingdee_outstock_locked(
+                bill_no, fhtz_fid, record_id, waybill_no, lock_key,
+                via_wms_fallback=via_wms_fallback,
+                actual_carrier=actual_carrier,
+            )
 
 
 async def _create_kingdee_outstock_locked(
@@ -2679,13 +2687,62 @@ async def _create_kingdee_outstock_locked(
         return None
 
 
-async def validate_outbound_callbacks():
+_outstock_last_attempt: dict[int, float] = {}
+
+
+async def _run_outstock_tasks(tasks, *, budget_seconds: float) -> dict:
+    """串行、软时间预算；未执行任务仍在数据库候选中，下轮重新校验。
+
+    不使用 wait_for 取消 Push/Audit。偶发慢调用可能越过预算，但不会再开启
+    下一张；失败或被锁占用的旧任务也需让位，避免固定排在最前造成饥饿。
+    """
+    active_ids = {task[2] for task in tasks}
+    for record_id in list(_outstock_last_attempt):
+        if record_id not in active_ids:
+            del _outstock_last_attempt[record_id]
+    tasks = sorted(tasks, key=lambda task: _outstock_last_attempt.get(task[2], 0))
+    started = time.monotonic()
+    attempted = 0
+    for bill_no, fhtz_fid, record_id, waybill, via_fallback, carrier in tasks:
+        if attempted and time.monotonic() - started >= budget_seconds:
+            break
+        try:
+            logger.info(
+                "%s开始创建金蝶出库单: %s (FID=%d, 运单=%s, 承运=%s)",
+                "[WMS兜底]" if via_fallback else "回调校验通过，",
+                bill_no, fhtz_fid, waybill, carrier,
+            )
+            created_no = await _create_kingdee_outstock(
+                bill_no, fhtz_fid, record_id, waybill_no=waybill,
+                via_wms_fallback=via_fallback, actual_carrier=carrier,
+            )
+            if via_fallback and created_no:
+                await _send_wecom_alert(
+                    "⚠️ 顺丰回调缺失（业务已发货）",
+                    f"**顺丰 WMS 已出库但我方未收到回调**\n"
+                    f"> 单号: {bill_no}\n> 出库单: {created_no}\n"
+                    f"> 处理: 已自动建 XSCK（回调缺失，请核对回调通道）",
+                )
+        except Exception:
+            # 登录/连接池等建单入口异常不能阻断其他单；不要盲目重试写接口。
+            logger.exception("出库任务异常，留待下轮核对: %s", bill_no)
+        finally:
+            _outstock_last_attempt[record_id] = time.monotonic()
+        attempted += 1
+    result = {"queued": len(tasks), "attempted": attempted, "deferred": len(tasks) - attempted}
+    logger.info("出库建单轮转: %s 耗时=%.1f秒", result, time.monotonic() - started)
+    return result
+
+
+async def validate_outbound_callbacks(*, build_budget_seconds: float = 45):
     """校验出库单回调 + 自动创建金蝶出库单
 
     流程：
     1. 检查 callback_ok/mismatch/timeout
     2. callback_ok 且尚未创建出库单 → 自动 Push 下推创建
     """
+    if build_budget_seconds <= 0:
+        raise ValueError("建单时间预算必须大于零")
     pool = await get_pool()
 
     async with pool.acquire() as conn:
@@ -2700,7 +2757,7 @@ async def validate_outbound_callbacks():
             WHERE bill_type = $1
               AND status IN ('success', 'callback_ok', 'callback_mismatch',
                              'timeout_alert', 'duplicate_outstock')
-            ORDER BY created_at DESC
+            ORDER BY created_at ASC, id ASC
             """,
             OUTBOUND_BILL_TYPE,
         )
@@ -2893,14 +2950,6 @@ async def validate_outbound_callbacks():
                             "🔁 WMS兜底: %s 顺丰 WMS=已出库 但回调缺失，建 XSCK 后将标为 outstock_created_no_callback (FHTZ_FID=%d, 运单=%s)",
                             bill_no, fhtz_fid, fallback_waybill,
                         )
-                        alerts.append((
-                            "⚠️ 顺丰回调缺失（业务已发货）",
-                            f"**顺丰 WMS 已出库但我方未收到回调**\n"
-                            f"> 单号: {bill_no}\n"
-                            f"> 承运: {fallback_carrier or '未知'}\n"
-                            f"> 运单: {fallback_waybill or '无'}\n"
-                            f"> 处理: 已自动建 XSCK（标记为「回调缺失」状态，请抽查对账）"
-                        ))
                         outstock_tasks.append(
                             (bill_no, fhtz_fid, rec["id"], fallback_waybill, True, fallback_carrier),
                         )
@@ -2930,24 +2979,9 @@ async def validate_outbound_callbacks():
                         alerts.append(("出库超时未回调", alert_msg))
                         logger.warning("⏰ 出库 %s 推送已 %d 分钟未收到回调", bill_no, int(elapsed))
 
+    await _run_outstock_tasks(outstock_tasks, budget_seconds=build_budget_seconds)
     for title, msg in alerts:
         await _send_wecom_alert(title, msg)
-
-    for bill_no, fhtz_fid, record_id, waybill, via_fallback, carrier in outstock_tasks:
-        logger.info(
-            "%s开始创建金蝶出库单: %s (FID=%d, 运单=%s, 承运=%s)",
-            "[WMS兜底]" if via_fallback else "回调校验通过，",
-            bill_no, fhtz_fid, waybill, carrier,
-        )
-        await _create_kingdee_outstock(
-            bill_no, fhtz_fid, record_id,
-            waybill_no=waybill, via_wms_fallback=via_fallback,
-            actual_carrier=carrier,
-        )
-
-    sync_result = await _sync_recent_outstock_logistics(limit=30)
-    if sync_result["synced"] or sync_result["failed"]:
-        logger.info("近期XSCK物流复检完成: %s", sync_result)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from datetime import timedelta, timezone
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -15,6 +16,7 @@ logger = logging.getLogger("union.sf_service.scheduler")
 TZ_CN = timezone(timedelta(hours=8))
 scheduler = AsyncIOScheduler(timezone=TZ_CN)
 _sf_auto_push_lock = asyncio.Lock()
+_sf_outbound_callback_lock = asyncio.Lock()
 
 
 def _env_enabled(name: str, default: str = "false") -> bool:
@@ -22,7 +24,7 @@ def _env_enabled(name: str, default: str = "false") -> bool:
 
 
 async def _run_sf_auto_push() -> None:
-    """扫描金蝶已审核单据，自动推送入库/出库单到顺丰 WMS + 校验回调。"""
+    """只负责推单；回调与历史物流复检使用独立调度。"""
     if _sf_auto_push_lock.locked():
         logger.warning("顺丰自动推送上一轮仍在运行，本轮跳过")
         return
@@ -34,18 +36,50 @@ async def _run_sf_auto_push() -> None:
                 ensure_table,
                 scan_and_push,
                 scan_and_push_outbound,
-                validate_callbacks,
-                validate_outbound_callbacks,
             )
 
             await ensure_table()
             count_in = await scan_and_push()
             count_out = await scan_and_push_outbound()
             logger.info("顺丰自动推送完成: 入库 %d 张, 出库 %d 张", count_in, count_out)
-            await validate_callbacks()
-            await validate_outbound_callbacks()
         except Exception:
             logger.exception("顺丰自动推送失败")
+
+
+async def _run_sf_outbound_callbacks() -> None:
+    """独立出库回调通道；不等待入库、推单和历史物流任务。"""
+    if _sf_outbound_callback_lock.locked():
+        logger.warning("出库回调上一轮仍在运行，本轮跳过")
+        return
+    async with _sf_outbound_callback_lock:
+        started = time.monotonic()
+        try:
+            from app.services.sf_automation import validate_outbound_callbacks
+
+            await validate_outbound_callbacks(build_budget_seconds=45)
+        except Exception:
+            logger.exception("独立出库回调处理失败")
+        finally:
+            logger.info("独立出库回调本轮耗时 %.1f 秒", time.monotonic() - started)
+
+
+async def _run_sf_inbound_callbacks() -> None:
+    try:
+        from app.services.sf_automation import validate_callbacks
+
+        await validate_callbacks()
+    except Exception:
+        logger.exception("独立入库回调处理失败")
+
+
+async def _run_sf_logistics_recheck() -> None:
+    try:
+        from app.services.sf_automation import _sync_recent_outstock_logistics
+
+        result = await _sync_recent_outstock_logistics(limit=30)
+        logger.info("独立近期XSCK物流复检完成: %s", result)
+    except Exception:
+        logger.exception("独立近期XSCK物流复检失败")
 
 
 async def _run_sf_wms_status_sync() -> None:
@@ -138,6 +172,19 @@ def start_scheduler() -> None:
         return
 
     scheduler.add_job(_run_sf_auto_push, CronTrigger(minute="*/5"), id="sf_auto_push", replace_existing=True)
+    # 显式限制单实例；时间预算只阻止开启下一张，绝不取消进行中的金蝶写入。
+    scheduler.add_job(
+        _run_sf_outbound_callbacks, CronTrigger(minute="*", second=10),
+        id="sf_outbound_callbacks", replace_existing=True, max_instances=1, coalesce=True,
+    )
+    scheduler.add_job(
+        _run_sf_inbound_callbacks, CronTrigger(minute="1-59/5"),
+        id="sf_inbound_callbacks", replace_existing=True, max_instances=1, coalesce=True,
+    )
+    scheduler.add_job(
+        _run_sf_logistics_recheck, CronTrigger(minute="3-59/5"),
+        id="sf_logistics_recheck", replace_existing=True, max_instances=1, coalesce=True,
+    )
     scheduler.add_job(
         _run_sf_wms_status_sync,
         CronTrigger(minute="2-59/5"),
