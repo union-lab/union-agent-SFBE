@@ -39,6 +39,17 @@ def test_never_changes_specification(spec):
     assert build_sf_item_name("博士伦", "软性亲水接触镜 Soft Lens", spec).endswith("，" + spec)
 
 
+def test_real_print_sample_english_prefix_in_spec_preserves_model_and_power():
+    assert build_sf_item_name(
+        "HanGee®韩姬儿®", "软性亲水接触镜（瓷泡泡）",
+        "Realcon Color 42，月抛/1片装，双色黑，后顶焦度-2.00D",
+    ) == "HanGee®韩姬儿®软性亲水接触镜（瓷泡泡），42，月抛/1片装，双色黑，后顶焦度-2.00D"
+
+
+def test_spec_prefix_not_removed_for_other_products():
+    assert build_sf_item_name("品牌", "其他商品", "Realcon Color 42") == "品牌 其他商品 Realcon Color 42"
+
+
 @pytest.mark.parametrize("brand,name,spec,expected", [
     (" 稳健 ", " 医用纱布片 Soft ", " 10cmX10cm 50片/盒 ", "稳健 医用纱布片 Soft 10cmX10cm 50片/盒"),
     ("", "隐形眼镜护理液", "适用于软性亲水接触镜 BC8.6", "隐形眼镜护理液 适用于软性亲水接触镜 BC8.6"),
@@ -63,6 +74,7 @@ def run_mocked(coro):
 @pytest.mark.parametrize("name,spec", [
     ("软性亲水接触镜Soft (Hydrophilic) Contact Lenskalifilcon A SVS", "日抛型，2片装，后顶焦度-6.00"),
     ("软性亲水接触镜（济州茶） Realcon Color", "BC<9 & DIA>14，-6.00"),
+    ("软性亲水接触镜（瓷泡泡）", "Realcon Color 42，月抛/1片装，双色黑，后顶焦度-2.00D"),
     ("医用纱布片 Soft", "10cmX10cm 50片/盒"),
 ])
 def test_both_item_service_paths_use_same_name_and_keep_source(monkeypatch, name, spec):

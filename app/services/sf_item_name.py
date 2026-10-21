@@ -10,6 +10,9 @@ _ENGLISH_NAME = re.compile(
     r"(?:[ \t,，./+&'’:\-]+[A-Za-zＡ-Ｚａ-ｚ0-9０-９®™]+)*"
 )
 _EMPTY_BRACKETS = re.compile(r"\([\s,，、;；]*\)|（[\s,，、;；]*）|\[[\s,，、;；]*\]")
+# 实际档案 HCYZL000341 的英文品名在规格开头。仅移除已核实的名称，
+# 保留后续 42 等型号数字和 D/BC/DIA 参数，不对整个规格通用删英文。
+_SPEC_NAME_PREFIX = re.compile(r"^Realcon\s+Color\b[ \t]*", re.IGNORECASE)
 
 
 def build_sf_item_name(brand: str | None, name: str | None, spec: str | None) -> str:
@@ -32,4 +35,7 @@ def build_sf_item_name(brand: str | None, name: str | None, spec: str | None) ->
             break
         short_name = cleaned
     short_name = re.sub(r"\s+", " ", short_name).strip(" ,，、;；")
-    return f"{brand}{short_name}" + (f"，{spec}" if spec else "")
+    display_spec, removed = _SPEC_NAME_PREFIX.subn("", spec)
+    if removed:
+        display_spec = display_spec.lstrip(" ,，")
+    return f"{brand}{short_name}" + (f"，{display_spec}" if display_spec else "")
