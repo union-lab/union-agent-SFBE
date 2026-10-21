@@ -31,6 +31,7 @@ import httpx
 from app.clients.kingdee import KingdeeClient
 from app.config import settings
 from app.db.pool import get_pool
+from app.services.sf_item_name import build_sf_item_name
 
 # 顺丰 ITEM_SERVICE 不接受 SKU 含汉字/全角字符
 # 例：金蝶里用 "HC0SW0054-禁" 表示停用，推到顺丰会被整批退回
@@ -206,11 +207,11 @@ async def _query_materials_batch(client: KingdeeClient, skus: list[str]) -> dict
 
 def _build_item_xml(item: dict) -> str:
     # 静茹 2026-04-21 要求：商品名称 = 品牌 + 商品名称 + 规格型号，按顺序拼接
-    # 空值跳过，用空格分隔（比如"优益诺 酒精棉片（小猴） 60mmX30mm 50片/盒"）
+    # 接触镜英文品名缩短规则与自动推单共用，其他商品维持原格式。
     brand = (item.get("brand") or "").strip()
     name = (item.get("name") or "").strip()
     spec = (item.get("spec") or "").strip()
-    full_name = " ".join(p for p in (brand, name, spec) if p)
+    full_name = build_sf_item_name(brand, name, spec)
     parts = [
         "<Item>",
         f"<SkuNo>{item['sku']}</SkuNo>",

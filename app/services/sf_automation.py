@@ -33,6 +33,7 @@ import httpx
 from app.config import settings
 from app.clients.kingdee import KingdeeClient
 from app.db.pool import get_pool
+from app.services.sf_item_name import build_sf_item_name
 
 logger = logging.getLogger("union.sf_auto")
 
@@ -302,13 +303,13 @@ async def _sf_sync_item(
     brand = (brand or "").strip()
     spec = (spec or "").strip()
     pure_name = (name or "").strip()
-    full_name = " ".join(p for p in (brand, pure_name, spec) if p)
+    full_name = build_sf_item_name(brand, pure_name, spec)
 
     item_parts = [
         "<Item>",
         f"<SkuNo>{sku}</SkuNo>",
-        f"<ItemName>{full_name}</ItemName>",
-        f"<ItemSpecifications>{spec}</ItemSpecifications>",
+        f"<ItemName>{html.escape(full_name, quote=False)}</ItemName>",
+        f"<ItemSpecifications>{html.escape(spec, quote=False)}</ItemSpecifications>",
         f"<ItemUom>{unit}</ItemUom>",
     ]
     bc = (barcode or "").strip()
