@@ -106,8 +106,8 @@ def test_scheduler_registers_independent_single_instance_jobs(monkeypatch):
     monkeypatch.setenv("SCHEDULER_ENABLED", "true")
     sched.start_scheduler()
     jobs = {job.id: job for job in scheduler.jobs}
-    assert len(jobs) == 8
-    for name in ("sf_outbound_callbacks", "sf_inbound_callbacks", "sf_logistics_recheck"):
+    assert len(jobs) == 9
+    for name in ("sf_outbound_callbacks", "sf_inbound_callbacks", "sf_logistics_recheck", "sf_audit_retry"):
         assert jobs[name].max_instances == 1 and jobs[name].coalesce
     trigger = jobs["sf_outbound_callbacks"].trigger
     now = datetime(2026, 10, 16, 17, 9, 0, tzinfo=trigger.timezone)
@@ -115,7 +115,7 @@ def test_scheduler_registers_independent_single_instance_jobs(monkeypatch):
     second = trigger.get_next_fire_time(first, first + timedelta(seconds=1))
     assert first.second == 10 and second - first == timedelta(minutes=1)
     sched.start_scheduler()
-    assert len(scheduler.jobs) == 8
+    assert len(scheduler.jobs) == 9
 
 
 def task(key, fallback=False):

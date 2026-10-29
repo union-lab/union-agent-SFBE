@@ -72,6 +72,15 @@ async def _run_sf_inbound_callbacks() -> None:
         logger.exception("独立入库回调处理失败")
 
 
+async def _run_sf_audit_retry() -> None:
+    try:
+        from app.services.sf_audit_retry import retry_failed_outstock_audits
+
+        await retry_failed_outstock_audits(budget_seconds=30)
+    except Exception:
+        logger.exception("顺丰出库延时补审失败")
+
+
 async def _run_sf_logistics_recheck() -> None:
     try:
         from app.services.sf_automation import _sync_recent_outstock_logistics
@@ -180,6 +189,10 @@ def start_scheduler() -> None:
     scheduler.add_job(
         _run_sf_inbound_callbacks, CronTrigger(minute="1-59/5"),
         id="sf_inbound_callbacks", replace_existing=True, max_instances=1, coalesce=True,
+    )
+    scheduler.add_job(
+        _run_sf_audit_retry, CronTrigger(minute="*", second=40),
+        id="sf_audit_retry", replace_existing=True, max_instances=1, coalesce=True,
     )
     scheduler.add_job(
         _run_sf_logistics_recheck, CronTrigger(minute="3-59/5"),
