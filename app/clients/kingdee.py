@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
 from typing import Any
@@ -34,6 +35,11 @@ _READONLY_SERVICES = (
     f"{_FORM_BASE}.ExecuteBillQuery",
 )
 _TRANSIENT_GATEWAY_STATUS = {502, 503, 504}
+
+# Only the SF integration account shares authentication, never HTTP clients.
+# Include credentials and environment so other accounts/tenants remain isolated.
+_SF_SESSIONS: dict[tuple, tuple[httpx.Cookies, float, dict]] = {}
+_SF_LOGIN_LOCKS: dict[tuple, asyncio.Lock] = {}
 
 
 class KingdeeError(Exception):
@@ -65,6 +71,7 @@ class KingdeeClient:
         self.username = username or settings.kingdee_username or ""
         self.password = password or settings.kingdee_password or ""
         self.is_test = test
+        self._share_session = self.username == "骆铭源" and not test
 
         self._cookies: httpx.Cookies | None = None
         self._login_at: float = 0
@@ -88,6 +95,18 @@ class KingdeeClient:
     async def _ensure_login(self) -> None:
         if not self._session_alive():
             await self.login()
+
+    def _session_key(self) -> tuple:
+        return (self.base_url, self.acct_id, self.username,
+                hashlib.sha256(self.password.encode()).digest())
+
+    def _invalidate_shared_session(self) -> None:
+        if self._share_session:
+            key = self._session_key()
+            cached = _SF_SESSIONS.get(key)
+            # A late failure from an old session must not evict a newer login.
+            if cached and cached[0] is self._cookies:
+                _SF_SESSIONS.pop(key, None)
 
     async def _call(
         self,
@@ -138,6 +157,7 @@ class KingdeeClient:
 
         if retry_on_session_lost and self._is_session_lost(result):
             logger.warning("金蝶会话丢失，重新登录后重试", extra={"service": service})
+            self._invalidate_shared_session()
             self._cookies = None
             return await self._call(service, payload, retry_on_session_lost=False)
 
@@ -176,6 +196,22 @@ class KingdeeClient:
     # ─── 认证 ──────────────────────────────────────────────
 
     async def login(self) -> dict:
+        """Reuse the SF account session across task clients; serialize refreshes."""
+        if not self._share_session:
+            return await self._login_new_session()
+        key = self._session_key()
+        lock = _SF_LOGIN_LOCKS.setdefault(key, asyncio.Lock())
+        async with lock:
+            cached = _SF_SESSIONS.get(key)
+            if cached and time.time() - cached[1] < _SESSION_TTL:
+                self._cookies, self._login_at, result = cached
+                logger.debug("顺丰金蝶会话复用（用户=%s）", self.username)
+                return dict(result)
+            result = await self._login_new_session()
+            _SF_SESSIONS[key] = (self._cookies, self._login_at, dict(result))
+            return result
+
+    async def _login_new_session(self) -> dict:
         """用户名密码登录（ValidateUser）"""
         url = self._url(f"{_AUTH_BASE}.ValidateUser")
         payload = {
@@ -203,6 +239,8 @@ class KingdeeClient:
 
     async def login_kick(self) -> dict:
         """登录并踢掉同账号的其他会话"""
+        self._invalidate_shared_session()
+        self._share_session = False
         url = self._url(f"{_AUTH_BASE}.ValidateUser2")
         payload = {
             "acctID": self.acct_id,
@@ -230,6 +268,7 @@ class KingdeeClient:
 
     async def logout(self) -> dict:
         """登出当前会话"""
+        self._invalidate_shared_session()
         url = self._url(f"{_AUTH_BASE}.Logout")
         resp = await self._http.post(
             url,
@@ -417,6 +456,11 @@ class KingdeeClient:
 
     async def switch_org(self, org_number: str) -> dict:
         """切换上下文默认组织"""
+        # Organization context is mutable; never change the shared task session.
+        if self._share_session:
+            self._share_session = False
+            self._cookies = None
+            self._login_at = 0
         result = await self._call(f"{_FORM_BASE}.SwitchOrg", {"OrgNumber": org_number})
         return self._extract_response(result)
 
