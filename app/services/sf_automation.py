@@ -404,6 +404,28 @@ async def ensure_table():
     logger.info("ads_sf_push_record 表就绪")
 
 
+async def _filter_scan_candidates(pool, bill_type: str, candidates: list[str], blacklist: set[str]) -> list[str]:
+    """Exclude handled orders locally BEFORE either per-order Kingdee query.
+
+    Keep the existing retryable statuses and bill-type boundary. The later
+    pre-push check remains in place to catch records changed during the scan.
+    """
+    async with pool.acquire() as conn:
+        existing = await conn.fetch(
+            """SELECT bill_no FROM ads_sf_push_record
+               WHERE bill_type = $1 AND bill_no = ANY($2::text[])
+                 AND status NOT IN ('failed', 'cancelled_by_unaudit', 'unaudit_cancel_failed')""",
+            bill_type, candidates,
+        )
+    handled = {r["bill_no"] for r in existing}
+    remaining = [bno for bno in candidates if bno not in handled and bno not in blacklist]
+    logger.info(
+        "SF扫描预过滤 type=%s candidates=%d skipped=%d detail_candidates=%d",
+        bill_type, len(candidates), len(candidates) - len(remaining), len(remaining),
+    )
+    return remaining
+
+
 async def scan_and_push():
     """扫描金蝶已审核单据，推送到顺丰"""
     pool = await get_pool()
@@ -461,6 +483,7 @@ async def scan_and_push():
                 _seen.add(bno)
                 candidate_bills.append(bno)
 
+        candidate_bills = await _filter_scan_candidates(pool, bill_type, candidate_bills, blacklist)
         bills: dict[str, list] = {}
         truncated_bills: dict[str, tuple[int, int]] = {}
         for bno in candidate_bills:
@@ -1924,6 +1947,9 @@ async def scan_and_push_outbound():
             candidate_bills.append(bno)
 
     logger.info("GSP发货通知单阶段1: 发现 %d 张候选单据", len(candidate_bills))
+    candidate_bills = await _filter_scan_candidates(
+        pool, OUTBOUND_BILL_TYPE, candidate_bills, blacklist,
+    )
 
     # field_keys 列序 (FID 在最前):
     # 0:FID, 1:FBillNo, 2:FDocumentStatus, 3:FDate,
