@@ -45,27 +45,33 @@ async def outbound_gate(content: str, *, cancellation: bool = False):
         yield False
         return
     pool = await get_pool()
-    async with pool.acquire() as conn, conn.transaction():
-        # Try locks, never let one busy/refunded order stall the scan behind it.
-        for bill in sorted(set(bills)):
-            if not await conn.fetchval(
-                "SELECT pg_try_advisory_xact_lock($1)", lock_key(bill),
-            ) or await held(conn, bill):
-                yield False
-                return
-        if cancellation:
-            # Commit before external IO on another connection. A concurrent
-            # newly-created hold must not cause the worker to repeat this call.
-            async with pool.acquire() as journal:
+    # Production uses direct PostgreSQL connections, like sf_audit_retry.
+    # A session lock lets the same connection commit a cancellation intent
+    # before network IO. Never borrow a second connection while every manual
+    # cancellation may already be holding one (pool-exhaustion deadlock).
+    async with pool.acquire() as conn:
+        acquired = []
+        try:
+            for bill in sorted(set(bills)):
+                key = lock_key(bill)
+                if not await conn.fetchval("SELECT pg_try_advisory_lock($1)", key):
+                    yield False
+                    return
+                acquired.append(key)
+                if await held(conn, bill):
+                    yield False
+                    return
+            if cancellation:
                 for bill in set(bills):
-                    await journal.execute(
+                    await conn.execute(
                         """INSERT INTO sf_api_legacy_cancel(bill_no) VALUES($1)
                            ON CONFLICT(bill_no) DO UPDATE SET attempted_at=now()""",
                         bill,
                     )
-        # Hold the per-order lock through network IO; a hold is still durable if
-        # it arrives while this request is in flight (and reports IN_FLIGHT).
-        yield True
+            yield True
+        finally:
+            for key in reversed(acquired):
+                await conn.execute("SELECT pg_advisory_unlock($1)", key)
 
 
 async def heartbeat():
