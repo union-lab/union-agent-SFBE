@@ -244,6 +244,16 @@ def _sf_ssl() -> ssl.SSLContext:
 
 
 async def _sf_send(service: str, content: str) -> tuple[bool, str, str]:
+    if service == "SALE_ORDER_SERVICE":
+        from app.services.sf_interception_guard import outbound_gate
+        async with outbound_gate(content) as allowed:
+            if not allowed:
+                return False, "", "SF_REFUND_HOLD_OR_ORDER_BUSY: 指定单据已阻断或正在处理"
+            return await _sf_send_unchecked(service, content)
+    return await _sf_send_unchecked(service, content)
+
+
+async def _sf_send_unchecked(service: str, content: str) -> tuple[bool, str, str]:
     """发送到顺丰，返回 (success, receipt_id, raw_response)"""
     sign = _sf_sign(content)
     headers = {
@@ -414,7 +424,10 @@ async def _filter_scan_candidates(pool, bill_type: str, candidates: list[str], b
         existing = await conn.fetch(
             """SELECT bill_no FROM ads_sf_push_record
                WHERE bill_type = $1 AND bill_no = ANY($2::text[])
-                 AND status NOT IN ('failed', 'cancelled_by_unaudit', 'unaudit_cancel_failed')""",
+                 AND (status NOT IN ('failed', 'cancelled_by_unaudit', 'unaudit_cancel_failed')
+                      OR EXISTS(SELECT 1 FROM sf_api_hold h WHERE h.bill_no=ads_sf_push_record.bill_no))
+               UNION SELECT bill_no FROM sf_api_hold WHERE bill_no=ANY($2::text[])
+                 AND $1='outbound'""",
             bill_type, candidates,
         )
     handled = {r["bill_no"] for r in existing}
@@ -806,13 +819,18 @@ async def retry_single_push(record_id: int) -> dict:
     pool = await get_pool()
     async with pool.acquire() as conn:
         rec = await conn.fetchrow(
-            "SELECT id, bill_no, bill_type, status, fhtz_fid FROM ads_sf_push_record WHERE id = $1",
+            "SELECT id, bill_no, bill_type, status, fhtz_fid, outstock_no FROM ads_sf_push_record WHERE id = $1",
             record_id,
         )
     if not rec:
         return {"success": False, "message": "记录不存在"}
 
     bill_type = rec["bill_type"]
+    if bill_type == OUTBOUND_BILL_TYPE:
+        from app.services.sf_interception_guard import held
+        async with pool.acquire() as conn:
+            if await held(conn, rec["bill_no"]):
+                return {"success": False, "message": "此单已退款阻断，不允许重推；请查询原拦截请求"}
 
     kd_user = os.getenv("KINGDEE_SF_USERNAME") or settings.kingdee_username or ""
     kd_pass = os.getenv("KINGDEE_SF_PASSWORD") or settings.kingdee_password or ""
@@ -3161,6 +3179,9 @@ async def scan_unaudit_and_cancel():
                 WHERE status <> ALL($1::text[])
                   AND bill_type = ANY($2::text[])
                   AND created_at >= now() - ($3 || ' days')::interval
+                  AND NOT EXISTS(SELECT 1 FROM sf_api_hold h
+                      WHERE h.bill_no=ads_sf_push_record.bill_no
+                      AND ads_sf_push_record.bill_type='outbound')
                 ORDER BY created_at DESC
                 LIMIT 1000
                 """,

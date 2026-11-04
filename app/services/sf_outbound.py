@@ -197,6 +197,17 @@ def _parse_orders(element: ET.Element) -> list[dict]:
 
 
 async def _send_request(service: str, content: str) -> dict:
+    if service in ("SALE_ORDER_SERVICE", "CANCEL_SALE_ORDER_SERVICE"):
+        from app.services.sf_interception_guard import outbound_gate
+        async with outbound_gate(content, cancellation=service == "CANCEL_SALE_ORDER_SERVICE") as allowed:
+            if not allowed:
+                return {"head": "ERROR", "error_code": "SF_REFUND_HOLD_OR_ORDER_BUSY",
+                        "error": "指定单据已退款阻断或正在处理，请查询原拦截操作；不得直接重推或重复取消"}
+            return await _send_request_unchecked(service, content)
+    return await _send_request_unchecked(service, content)
+
+
+async def _send_request_unchecked(service: str, content: str) -> dict:
     sign = _make_sign(content)
     headers = {
         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
