@@ -81,6 +81,14 @@ async def _run_sf_audit_retry() -> None:
         logger.exception("顺丰出库延时补审失败")
 
 
+async def _run_sf_interception() -> None:
+    try:
+        from app.services.sf_interception_worker import run
+        await run()
+    except Exception:
+        logger.exception("顺丰受控拦截执行失败；保持逐单阻断，不影响其他调度任务")
+
+
 async def _run_sf_logistics_recheck() -> None:
     try:
         from app.services.sf_automation import _sync_recent_outstock_logistics
@@ -181,6 +189,10 @@ def start_scheduler() -> None:
         return
 
     scheduler.add_job(_run_sf_auto_push, CronTrigger(minute="*/5"), id="sf_auto_push", replace_existing=True)
+    scheduler.add_job(
+        _run_sf_interception, CronTrigger(minute="*", second=25),
+        id="sf_interception", replace_existing=True, max_instances=1, coalesce=True,
+    )
     # 显式限制单实例；时间预算只阻止开启下一张，绝不取消进行中的金蝶写入。
     scheduler.add_job(
         _run_sf_outbound_callbacks, CronTrigger(minute="*", second=10),
