@@ -102,3 +102,24 @@ async def test_automation_uses_same_gate(monkeypatch):
     xml = "<Request><SaleOrders><SaleOrder><ErpOrder>FHTZ1</ErpOrder></SaleOrder></SaleOrders></Request>"
     assert (await sf_automation._sf_send("SALE_ORDER_SERVICE", xml))[0] is False
     network.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_legacy_cancellation_journals_and_unlocks_with_only_one_connection(monkeypatch):
+    conn = AsyncMock()
+    conn.fetchval.side_effect = [True, False]
+    acquisitions = []
+    class Pool:
+        def acquire(self):
+            acquisitions.append(1)
+            assert len(acquisitions) == 1, "nested pool borrowing can deadlock"
+            return Context(conn)
+    monkeypatch.setattr(guard, "get_pool", AsyncMock(return_value=Pool()))
+    xml = "<Request><SaleOrders><SaleOrder><ErpOrder>FHTZ1</ErpOrder></SaleOrder></SaleOrders></Request>"
+    with pytest.raises(RuntimeError, match="network interrupted"):
+        async with guard.outbound_gate(xml, cancellation=True) as allowed:
+            assert allowed
+            assert "INSERT INTO sf_api_legacy_cancel" in conn.execute.await_args.args[0]
+            raise RuntimeError("network interrupted")
+    assert "pg_advisory_unlock" in conn.execute.await_args.args[0]
+    conn.transaction.assert_not_called()

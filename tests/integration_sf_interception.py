@@ -168,6 +168,23 @@ async def main():
             await worker.execute_one(pool, row)
             assert send.await_count == (1 if case in ("timeout", "negative") else 0), "replayed"
         # Expired executor: refuse new writes while original results remain queryable.
+        # A legacy cancel must work even with a one-connection pool; its intent
+        # is committed before IO and its session lock is released afterwards.
+        single = await asyncpg.create_pool(dsn, min_size=1, max_size=1)
+        async def single_pool():
+            return single
+        guard.get_pool = single_pool
+        try:
+            async with asyncio.timeout(5):
+                async with guard.outbound_gate(xml.replace("FHTZ1", "FHTZ16"), cancellation=True) as allowed:
+                    assert allowed
+            async with single.acquire() as c:
+                assert await c.fetchval("SELECT EXISTS(SELECT 1 FROM sf_api_legacy_cancel WHERE bill_no='FHTZ16')")
+                assert await c.fetchval("SELECT pg_try_advisory_lock($1)", guard.lock_key("FHTZ16"))
+                await c.execute("SELECT pg_advisory_unlock($1)", guard.lock_key("FHTZ16"))
+        finally:
+            guard.get_pool = get_pool
+            await single.close()
         async with pool.acquire() as conn:
             await conn.execute("UPDATE sf_api_runtime SET heartbeat_at=now()-interval '1 hour'")
         try:
