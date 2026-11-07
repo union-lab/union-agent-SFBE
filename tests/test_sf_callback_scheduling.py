@@ -38,7 +38,7 @@ def test_callback_runs_even_while_push_is_locked(monkeypatch):
     assert calls == [{"build_budget_seconds": 45}]
 
 
-def test_push_no_longer_calls_callbacks_or_logistics(monkeypatch):
+def test_push_never_runs_ddl_callbacks_or_logistics(monkeypatch):
     calls = []
 
     def operation(name):
@@ -52,7 +52,8 @@ def test_push_no_longer_calls_callbacks_or_logistics(monkeypatch):
         monkeypatch.setattr(service, name, operation(name))
     monkeypatch.setattr(sched, "_sf_auto_push_lock", asyncio.Lock())
     run(sched._run_sf_auto_push())
-    assert calls == ["ensure_table", "scan_and_push", "scan_and_push_outbound"]
+    run(sched._run_sf_auto_push())
+    assert calls == ["scan_and_push", "scan_and_push_outbound"] * 2
 
 
 def test_callback_error_releases_lock_and_next_run_works(monkeypatch):
