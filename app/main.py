@@ -17,6 +17,7 @@ from app.config import settings
 from app.db.pool import close_pool, init_pool
 from app.logging_config import setup_logging
 from app.scheduler import get_scheduler_state, start_scheduler, stop_scheduler
+from app.services.sf_automation import check_push_record_schema
 
 setup_logging(log_level=settings.log_level, log_format=settings.log_format)
 logger = logging.getLogger("union.sf_service")
@@ -27,9 +28,11 @@ async def lifespan(app: FastAPI):
     try:
         await init_pool()
         logger.info("SF service asyncpg pool initialized")
+        await check_push_record_schema()
         start_scheduler()
     except Exception as exc:
-        logger.error("SF service asyncpg pool init failed: %s", exc, exc_info=True)
+        logger.error("SF service startup failed: %s", exc, exc_info=True)
+        await close_pool()
         raise
 
     yield

@@ -33,12 +33,11 @@ async def _run_sf_auto_push() -> None:
         logger.info("定时任务: 顺丰自动推送（入库+出库）")
         try:
             from app.services.sf_automation import (
-                ensure_table,
                 scan_and_push,
                 scan_and_push_outbound,
             )
 
-            await ensure_table()
+            # 表结构在服务启动时只读校验；业务运行期间禁止排队申请 DDL 锁。
             count_in = await scan_and_push()
             count_out = await scan_and_push_outbound()
             logger.info("顺丰自动推送完成: 入库 %d 张, 出库 %d 张", count_in, count_out)

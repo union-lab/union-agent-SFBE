@@ -406,12 +406,33 @@ async def _query_material_gsp(client: KingdeeClient, sku: str) -> dict:
 # ── 核心逻辑 ──
 
 async def ensure_table():
-    """确保 ads_sf_push_record 表存在，并补齐新列"""
+    """仅供显式初始化使用；不得从调度任务或请求处理路径调用。"""
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute(DDL_ADS_SF_PUSH_RECORD)
         await conn.execute(DDL_ALTER_PUSH_RECORD)
     logger.info("ads_sf_push_record 表就绪")
+
+
+async def check_push_record_schema():
+    """启动前只读校验所需字段，不扫描数据、不创建或修改表。
+
+    ALTER TABLE ... IF NOT EXISTS 即使无需变更也会申请排他锁；
+    运行中排队会阻塞页面查询和出库结果写入。缺表/缺列时拒绝启动，
+    交由显式初始化处理，不能在业务任务里自动补表。
+    """
+    pool = await get_pool()
+    async with pool.acquire(timeout=10) as conn:
+        await conn.execute(
+            """SELECT id, bill_no, bill_type, erp_order, sf_receipt_id, status,
+                      items_json, sf_response, error_message, fhtz_fid, outstock_no,
+                      created_at, updated_at, carrier_code, carrier_name,
+                      waybill_no, sf_wms_status, sf_wms_status_text, cancelled_at,
+                      cancel_reason, unaudit_detected_at
+               FROM ads_sf_push_record LIMIT 0""",
+            timeout=10,
+        )
+    logger.info("ads_sf_push_record 只读结构校验通过")
 
 
 async def _filter_scan_candidates(pool, bill_type: str, candidates: list[str], blacklist: set[str]) -> list[str]:
