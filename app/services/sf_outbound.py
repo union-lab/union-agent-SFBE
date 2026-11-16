@@ -557,4 +557,9 @@ async def query_outbound_status(erp_order: str) -> dict:
     content = _build_xml("SALE_ORDER_STATUS_QUERY_SERVICE", query_xml)
 
     logger.info(f"顺丰查询出库状态: {erp_order}")
-    return await _send_request("SALE_ORDER_STATUS_QUERY_SERVICE", content)
+    result = await _send_request("SALE_ORDER_STATUS_QUERY_SERVICE", content)
+    if result.get("head") == "OK":
+        from app.services.sf_node_history import safe_store_response
+
+        await safe_store_response(result.get("raw", ""), [erp_order])
+    return result

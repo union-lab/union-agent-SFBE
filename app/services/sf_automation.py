@@ -1634,6 +1634,11 @@ async def sync_sale_order_waybill_from_outstock(
                 },
             })
             result["updated"].append(sale_order_no)
+            from app.services.sf_node_history import record_waybill_saved
+
+            await record_waybill_saved(
+                outstock_no, sale_order_no, target_waybill, datetime.now(timezone.utc),
+            )
             logger.info(
                 "%s: 销售订单快递单号已回写 %s ← %s（来源 XSCK %s）",
                 log_prefix, sale_order_no, target_waybill, outstock_no,
