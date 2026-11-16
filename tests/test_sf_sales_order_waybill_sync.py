@@ -9,7 +9,7 @@ import pytest
 def capture_events(monkeypatch):
     events = []
 
-    async def capture(*args):
+    async def capture(*args, **kwargs):
         events.append(args)
 
     monkeypatch.setattr(sf_node_history, "record_waybill_saved", capture)

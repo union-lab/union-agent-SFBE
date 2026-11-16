@@ -76,11 +76,15 @@ async def safe_store_response(raw_xml, expected):
         return 0
 
 
-async def record_waybill_saved(outstock_no, sale_order_no, waybill_no, occurred_at):
+async def record_waybill_saved(outstock_no, sale_order_no, waybill_no, occurred_at, *, bill_no=""):
     """Record only an actual successful Save; an already-present value has unknown age."""
     try:
         pool = await get_pool()
         async with pool.acquire(timeout=5) as conn:
+            if bill_no:
+                await insert_events(conn, [(bill_no, "kingdee_waybill_saved", occurred_at,
+                                           "kingdee_sale_order", sale_order_no + ":" + waybill_no)])
+                return
             await conn.execute(
                 """INSERT INTO public.sf_order_node_event
                    (bill_no,node_code,occurred_at,source,reference)

@@ -1527,6 +1527,7 @@ async def sync_sale_order_waybill_from_outstock(
     waybill_no: str = "",
     *,
     log_prefix: str,
+    bill_no: str = "",
 ) -> dict:
     """将 XSCK 的顺丰运单号回写到来源销售订单的“快递单号”。
 
@@ -1637,7 +1638,7 @@ async def sync_sale_order_waybill_from_outstock(
             from app.services.sf_node_history import record_waybill_saved
 
             await record_waybill_saved(
-                outstock_no, sale_order_no, target_waybill, datetime.now(timezone.utc),
+                outstock_no, sale_order_no, target_waybill, datetime.now(timezone.utc), bill_no=bill_no,
             )
             logger.info(
                 "%s: 销售订单快递单号已回写 %s ← %s（来源 XSCK %s）",
@@ -1691,11 +1692,12 @@ async def _try_sync_sale_order_waybill_from_outstock(
     waybill_no: str,
     *,
     log_prefix: str,
+    bill_no: str = "",
 ) -> dict:
     """出库主流程调用的安全包装：销售订单回写失败不能影响出库。"""
     try:
         result = await sync_sale_order_waybill_from_outstock(
-            kingdee, outstock_no, waybill_no, log_prefix=log_prefix,
+            kingdee, outstock_no, waybill_no, log_prefix=log_prefix, bill_no=bill_no,
         )
         if result["failed"]:
             logger.warning("%s: 销售订单快递单号未完全回写: %s", log_prefix, result["failed"])
@@ -2529,6 +2531,7 @@ async def _create_kingdee_outstock_locked(
             if doc_status == "C":
                 await _try_sync_sale_order_waybill_from_outstock(
                     kingdee, outstock_no, waybill_no,
+                    bill_no=bill_no,
                     log_prefix="已审核XSCK销售订单快递单号回写",
                 )
                 async with pool.acquire() as conn:
@@ -2555,6 +2558,7 @@ async def _create_kingdee_outstock_locked(
             logger.info("补 Audit 成功: %s", outstock_no)
             await _try_sync_sale_order_waybill_from_outstock(
                 kingdee, outstock_no, waybill_no,
+                bill_no=bill_no,
                 log_prefix="补审核XSCK销售订单快递单号回写",
             )
             async with pool.acquire() as conn:
@@ -2609,6 +2613,7 @@ async def _create_kingdee_outstock_locked(
         logger.info("Audit 成功: %s → %s", outstock_no, audit_result)
         await _try_sync_sale_order_waybill_from_outstock(
             kingdee, outstock_no, waybill_no,
+            bill_no=bill_no,
             log_prefix="新建XSCK销售订单快递单号回写",
         )
 
@@ -2655,6 +2660,7 @@ async def _create_kingdee_outstock_locked(
                 )
                 await _try_sync_sale_order_waybill_from_outstock(
                     kingdee, already_no, waybill_no,
+                    bill_no=bill_no,
                     log_prefix="幂等已审核XSCK销售订单快递单号回写",
                 )
             async with pool.acquire() as conn:
@@ -2694,6 +2700,7 @@ async def _create_kingdee_outstock_locked(
                             )
                             await _try_sync_sale_order_waybill_from_outstock(
                                 kingdee, err_xb, waybill_no,
+                                bill_no=bill_no,
                                 log_prefix="Submit幂等XSCK销售订单快递单号回写",
                             )
                             async with pool.acquire() as conn:
@@ -2720,6 +2727,7 @@ async def _create_kingdee_outstock_locked(
                                 )
                                 await _try_sync_sale_order_waybill_from_outstock(
                                     kingdee, err_xb, waybill_no,
+                                    bill_no=bill_no,
                                     log_prefix="补Audit后XSCK销售订单快递单号回写",
                                 )
                                 async with pool.acquire() as conn:
