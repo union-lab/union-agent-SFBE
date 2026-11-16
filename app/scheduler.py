@@ -165,6 +165,16 @@ async def _run_sf_first_camp_sync() -> None:
         logger.exception("首营档案同步失败")
 
 
+async def _run_sf_node_history() -> None:
+    try:
+        from app.services.sf_node_history import sync_missing_nodes
+
+        count = await sync_missing_nodes()
+        logger.info("SF node history checked %d orders", count)
+    except Exception:
+        logger.exception("SF node history collection failed")
+
+
 def get_scheduler_state() -> dict:
     return {
         "enabled": _env_enabled("SCHEDULER_ENABLED", "false"),
@@ -229,6 +239,10 @@ def start_scheduler() -> None:
         replace_existing=True,
     )
 
+    scheduler.add_job(
+        _run_sf_node_history, CronTrigger(minute="4-59/5", second=30),
+        id="sf_node_history", replace_existing=True, max_instances=1, coalesce=True,
+    )
     scheduler.start()
     logger.info("独立顺丰定时调度器已启动，%d 个任务", len(scheduler.get_jobs()))
     for job in scheduler.get_jobs():

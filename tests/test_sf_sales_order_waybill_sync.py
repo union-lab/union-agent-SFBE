@@ -1,6 +1,19 @@
 from __future__ import annotations
 
 from app.services import sf_automation
+from app.services import sf_node_history
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def capture_events(monkeypatch):
+    events = []
+
+    async def capture(*args, **kwargs):
+        events.append(args)
+
+    monkeypatch.setattr(sf_node_history, "record_waybill_saved", capture)
+    return events
 
 
 class _Kingdee:
@@ -38,7 +51,7 @@ def _run_immediate(coro):
     raise AssertionError("mocked coroutine unexpectedly suspended")
 
 
-def test_sync_sale_order_waybill_updates_only_empty_source_orders() -> None:
+def test_sync_sale_order_waybill_updates_only_empty_source_orders(capture_events) -> None:
     kingdee = _Kingdee({
         "XSDD20260829000223": [496406, "XSDD20260829000223", "C", ""],
         "XSDD20260829000224": [496407, "XSDD20260829000224", "C", " "],
@@ -56,6 +69,8 @@ def test_sync_sale_order_waybill_updates_only_empty_source_orders() -> None:
     assert result["source_orders"] == ["XSDD20260829000223", "XSDD20260829000224"]
     assert result["updated"] == ["XSDD20260829000223", "XSDD20260829000224"]
     assert not result["failed"]
+    assert len(capture_events) == 2
+    assert capture_events[0][1:3] == ("XSDD20260829000223", "SF6048643216347")
     assert kingdee.saves == [
         ("SAL_SaleOrder", {
             "NeedUpDateFields": ["F_YLYL_Text9"],
@@ -75,7 +90,7 @@ def test_sync_sale_order_waybill_updates_only_empty_source_orders() -> None:
     assert all("FDocumentStatus" not in str(data) for _, data in kingdee.saves)
 
 
-def test_sync_sale_order_waybill_never_overwrites_existing_values() -> None:
+def test_sync_sale_order_waybill_never_overwrites_existing_values(capture_events) -> None:
     kingdee = _Kingdee({
         "XSDD20260829000223": [496406, "XSDD20260829000223", "C", "SF6048643216347"],
         "XSDD20260829000224": [496407, "XSDD20260829000224", "C", "SF9999999999999"],
@@ -98,6 +113,7 @@ def test_sync_sale_order_waybill_never_overwrites_existing_values() -> None:
     }]
     assert not result["failed"]
     assert kingdee.saves == []
+    assert capture_events == []
 
 
 def test_sync_sale_order_waybill_uses_outstock_waybill_when_record_is_empty() -> None:
