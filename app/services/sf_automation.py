@@ -3425,8 +3425,16 @@ async def scan_unaudit_and_cancel():
 
             # 调顺丰取消接口
             is_outbound = bill_type in _OUTBOUND_BILL_TYPES
+            if bill_type == "outbound":
+                from app.services.sf_auto_cancel_result import cancel_and_record
+
+                # Persist the attempt before dispatch. A journal outage must not
+                # turn an unsent request into a terminal cancellation failure.
+                resp = await cancel_and_record(bill_no, erp_order, rec["sf_receipt_id"] or "")
             try:
-                if is_outbound:
+                if bill_type == "outbound":
+                    pass  # The journalled path above already sent this request.
+                elif is_outbound:
                     resp = await cancel_outbound_order(
                         erp_order=erp_order,
                         shipment_id=(rec["sf_receipt_id"] or ""),
