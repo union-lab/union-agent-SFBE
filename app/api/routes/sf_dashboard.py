@@ -16,6 +16,7 @@ from pydantic import BaseModel
 
 from app.db.pool import get_pool, row_to_dict
 from app.services import sf_item_push
+from app.services.sf_inbound_display import load_summaries
 from app.services.sf_wms_polling import WmsPollQueue
 
 router = APIRouter(prefix="/api/sf/dashboard", tags=["顺丰中控平台"])
@@ -279,7 +280,7 @@ async def list_records(
         )
         rows = await conn.fetch(
             f"""SELECT r.id, r.bill_no, r.bill_type, r.erp_order,
-                       r.sf_receipt_id, r.status, r.error_message,
+                       r.sf_receipt_id, r.status, r.error_message, r.items_json,
                        r.outstock_no, r.fhtz_fid,
                        r.carrier_code, r.carrier_name, r.waybill_no,
                        r.sf_wms_status, r.sf_wms_status_text,
@@ -298,9 +299,13 @@ async def list_records(
             *params, page_size, (page - 1) * page_size,
         )
 
+        inbound_summaries = await load_summaries(conn, rows)
+
     items = []
     for r in rows:
         d = row_to_dict(r)
+        d.pop("items_json", None)
+        d["inbound_receipt"] = inbound_summaries.get(d["id"])
         d["status_label"] = STATUS_LABELS.get(d.get("status", ""), d.get("status", ""))
         d["bill_type_label"] = BILL_TYPE_LABELS.get(d.get("bill_type", ""), d.get("bill_type", ""))
         items.append(d)
@@ -334,7 +339,10 @@ async def get_record_detail(record_id: int):
             rec["outstock_no"],
         )
 
+        inbound_summaries = await load_summaries(conn, [rec])
+
     d = row_to_dict(rec)
+    d["inbound_receipt"] = inbound_summaries.get(d["id"])
     d["status_label"] = STATUS_LABELS.get(d.get("status", ""), d.get("status", ""))
     d["bill_type_label"] = BILL_TYPE_LABELS.get(d.get("bill_type", ""), d.get("bill_type", ""))
 
