@@ -10,13 +10,14 @@ import json
 import logging
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
+from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from app.db.pool import get_pool, row_to_dict
 from app.services import sf_item_push
-from app.services.sf_inbound_display import load_summaries
+from app.services.sf_inbound_display import INBOUND, load_summaries
 from app.services.sf_wms_polling import WmsPollQueue
 
 router = APIRouter(prefix="/api/sf/dashboard", tags=["顺丰中控平台"])
@@ -208,6 +209,7 @@ async def list_records(
     search: str | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
+    inbound_state: Literal["complete", "partial", "unknown"] | None = None,
 ):
     """分页查询推送记录，支持状态/类型/WMS状态/日期/关键词筛选"""
     pool = await get_pool()
@@ -275,6 +277,27 @@ async def list_records(
     where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
 
     async with pool.acquire() as conn:
+        inbound_summaries = None
+        if inbound_state:
+            # 先筛选所有候选入库单，再分页；复用展示判定，避免口径漂移。
+            conditions.append(f"r.bill_type = ANY(${idx}::text[])")
+            params.append(sorted(INBOUND))
+            idx += 1
+            where = f" WHERE {' AND '.join(conditions)}"
+            candidates = await conn.fetch(
+                f"""SELECT r.id, r.bill_no, r.erp_order, r.bill_type, r.items_json
+                    FROM ads_sf_push_record r{where}""",
+                *params,
+            )
+            inbound_summaries = await load_summaries(conn, candidates)
+            matching_ids = [
+                record_id for record_id, summary in inbound_summaries.items()
+                if summary["state"] == inbound_state
+            ]
+            conditions.append(f"r.id = ANY(${idx}::bigint[])")
+            params.append(matching_ids)
+            idx += 1
+            where = f" WHERE {' AND '.join(conditions)}"
         total = await conn.fetchval(
             f"SELECT count(*) FROM ads_sf_push_record r{where}", *params
         )
@@ -294,12 +317,13 @@ async def list_records(
                                 AND L.erp_order = r.outstock_no)
                        ) AS callback_count
                 FROM ads_sf_push_record r{where}
-                ORDER BY r.created_at DESC
+                ORDER BY r.created_at DESC, r.id DESC
                 LIMIT ${idx} OFFSET ${idx + 1}""",
             *params, page_size, (page - 1) * page_size,
         )
 
-        inbound_summaries = await load_summaries(conn, rows)
+        if inbound_summaries is None:
+            inbound_summaries = await load_summaries(conn, rows)
 
     items = []
     for r in rows:
