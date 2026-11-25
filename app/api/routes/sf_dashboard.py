@@ -17,6 +17,7 @@ from pydantic import BaseModel
 
 from app.db.pool import get_pool, row_to_dict
 from app.services import sf_item_push
+from app.services.sf_error_display import fill_push_error, response_error
 from app.services.sf_inbound_display import INBOUND, load_summaries
 from app.services.sf_wms_polling import WmsPollQueue
 
@@ -304,6 +305,7 @@ async def list_records(
         rows = await conn.fetch(
             f"""SELECT r.id, r.bill_no, r.bill_type, r.erp_order,
                        r.sf_receipt_id, r.status, r.error_message, r.items_json,
+                       CASE WHEN r.status = 'failed' THEN r.sf_response END AS sf_response,
                        r.outstock_no, r.fhtz_fid,
                        r.carrier_code, r.carrier_name, r.waybill_no,
                        r.sf_wms_status, r.sf_wms_status_text,
@@ -328,6 +330,8 @@ async def list_records(
     items = []
     for r in rows:
         d = row_to_dict(r)
+        fill_push_error(d)
+        d.pop("sf_response", None)
         d.pop("items_json", None)
         d["inbound_receipt"] = inbound_summaries.get(d["id"])
         d["status_label"] = STATUS_LABELS.get(d.get("status", ""), d.get("status", ""))
@@ -366,6 +370,7 @@ async def get_record_detail(record_id: int):
         inbound_summaries = await load_summaries(conn, [rec])
 
     d = row_to_dict(rec)
+    fill_push_error(d)
     d["inbound_receipt"] = inbound_summaries.get(d["id"])
     d["status_label"] = STATUS_LABELS.get(d.get("status", ""), d.get("status", ""))
     d["bill_type_label"] = BILL_TYPE_LABELS.get(d.get("bill_type", ""), d.get("bill_type", ""))
@@ -554,7 +559,13 @@ async def get_wms_status(record_id: int):
         raise HTTPException(502, f"顺丰状态查询失败: {e}")
 
     if result.get("head") != "OK":
-        return {"success": False, "message": "顺丰返回异常", "raw": result.get("raw", "")[:500]}
+        raw = result.get("raw") or ""
+        message = response_error(raw, (rec["bill_no"],))
+        return {
+            "success": False,
+            "message": message or "顺丰返回异常，未提供具体错误原因",
+            "raw": raw[:500],
+        }
 
     raw_xml = result.get("raw", "")
     steps = _parse_wms_steps(raw_xml)
